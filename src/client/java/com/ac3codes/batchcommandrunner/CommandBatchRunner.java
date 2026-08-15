@@ -1,13 +1,15 @@
 package com.ac3codes.batchcommandrunner;
 
+import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
 
 import java.util.ArrayList;
 import java.util.List;
 
 public final class CommandBatchRunner {
     public enum Status {
-        IDLE("Idle"),
+        IDLE("Not active"),
         RUNNING("Running"),
         COMPLETED("Completed"),
         STOPPED("Stopped"),
@@ -103,7 +105,7 @@ public final class CommandBatchRunner {
         }
 
         if (nextIndex < 0 || nextIndex >= commands.size()) {
-            finish();
+            finish(client);
             return;
         }
 
@@ -127,17 +129,24 @@ public final class CommandBatchRunner {
         nextIndex++;
 
         if (nextIndex >= commands.size()) {
-            finish();
+            finish(client);
         } else {
             // A value of 1 inserts one full client tick between command sends.
             ticksUntilNext = delayTicks;
         }
     }
 
-    private static void finish() {
+    private static void finish(Minecraft client) {
         status = Status.COMPLETED;
         nextIndex = -1;
         ticksUntilNext = 0;
+
+        if (client.player != null) {
+            client.player.sendSystemMessage(
+                    Component.literal("BCR --> You: List of Commands Completed")
+                            .withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC)
+            );
+        }
     }
 
     public static boolean isRunning() {

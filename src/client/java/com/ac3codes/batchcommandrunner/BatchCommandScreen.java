@@ -1,15 +1,30 @@
 package com.ac3codes.batchcommandrunner;
 
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.ParseResults;
+import com.mojang.brigadier.StringReader;
+import com.mojang.brigadier.suggestion.Suggestion;
+import com.mojang.brigadier.suggestion.Suggestions;
+import net.minecraft.ChatFormatting;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.MultiLineEditBox;
+import net.minecraft.client.gui.components.MultilineTextField;
+import net.minecraft.client.gui.components.Whence;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.multiplayer.ClientSuggestionProvider;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
 
+import java.lang.reflect.Field;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 public final class BatchCommandScreen extends Screen {
+    private static final int MAX_SUGGESTIONS_SHOWN = 6;
+
     private static String savedText = "";
     private static String savedDelay = "1";
 
@@ -22,6 +37,20 @@ public final class BatchCommandScreen extends Screen {
     private Button clearButton;
 
     private int parsedCommandCount;
+
+    // Backing model of commandBox, unwrapped via reflection since MultiLineEditBox exposes
+    // no public cursor/line API of its own — needed to drive command-suggestion lookups.
+    private MultilineTextField editModel;
+    private List<Suggestion> currentSuggestions = List.of();
+    private int suggestionIndex;
+    private int currentLineStart;
+    private CompletableFuture<Suggestions> pendingSuggestions;
+    private String lastSuggestionValue;
+    private int lastSuggestionCursor = -1;
+    private boolean cyclingActive;
+    private int cycleAbsoluteStart;
+    private int cycleInsertedLength;
+    private boolean suppressNextAutoRefresh;
 
     public BatchCommandScreen(Screen parent) {
         super(Component.literal("Batch Command Runner"));
@@ -49,11 +78,18 @@ public final class BatchCommandScreen extends Screen {
         commandBox.setValueListener(value -> {
             savedText = value;
             parsedCommandCount = CommandBatchRunner.parseCommands(value).size();
+            if (!CommandBatchRunner.isRunning() && CommandBatchRunner.status() != CommandBatchRunner.Status.IDLE) {
+                CommandBatchRunner.reset();
+            }
         });
         parsedCommandCount = CommandBatchRunner.parseCommands(savedText).size();
         this.addRenderableWidget(commandBox);
+        this.editModel = extractTextField(commandBox);
+        clearSuggestions();
 
-        int infoY = top + editorHeight + 9;
+        // Extra clearance below the box's own built-in "X / Y characters" decoration
+        // (rendered by MultiLineEditBox itself just under its bottom edge).
+        int infoY = top + editorHeight + this.font.lineHeight + 9;
         delayBox = new EditBox(this.font, margin + 48, infoY - 5, 55, 18, Component.literal("Delay ticks"));
         delayBox.setValue(savedDelay);
         delayBox.setResponder(value -> {
@@ -89,6 +125,16 @@ public final class BatchCommandScreen extends Screen {
         this.setInitialFocus(commandBox);
     }
 
+    private static MultilineTextField extractTextField(MultiLineEditBox box) {
+        try {
+            Field field = MultiLineEditBox.class.getDeclaredField("textField");
+            field.setAccessible(true);
+            return (MultilineTextField) field.get(box);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private void runCommands() {
         List<String> commands = CommandBatchRunner.parseCommands(commandBox.getValue());
         if (commands.isEmpty()) {
@@ -121,6 +167,7 @@ public final class BatchCommandScreen extends Screen {
         commandBox.setValue("");
         parsedCommandCount = 0;
         CommandBatchRunner.reset();
+        clearSuggestions();
     }
 
     private void updateWidgetStates() {
@@ -140,6 +187,117 @@ public final class BatchCommandScreen extends Screen {
         super.tick();
         parsedCommandCount = CommandBatchRunner.parseCommands(commandBox.getValue()).size();
         updateWidgetStates();
+        updateSuggestions();
+    }
+
+    @Override
+    public boolean keyPressed(KeyEvent event) {
+        if (event.isCycleFocus() && commandBox.isFocused() && !CommandBatchRunner.isRunning() && !currentSuggestions.isEmpty()) {
+            acceptSuggestion();
+            return true;
+        }
+        // hasControlDownWithQuirk() resolves to Cmd on macOS and Ctrl elsewhere, matching
+        // the modifier Minecraft already uses for its own copy/paste/select-all shortcuts.
+        if ((event.key() == 257 || event.key() == 335) && event.hasControlDownWithQuirk()) {
+            if (runButton.active) {
+                runCommands();
+            }
+            return true;
+        }
+        return super.keyPressed(event);
+    }
+
+    private void updateSuggestions() {
+        if (editModel == null || this.minecraft == null || this.minecraft.player == null
+                || CommandBatchRunner.isRunning() || !commandBox.isFocused()) {
+            clearSuggestions();
+            return;
+        }
+
+        String value = editModel.value();
+        int cursor = editModel.cursor();
+        if (value.equals(lastSuggestionValue) && cursor == lastSuggestionCursor) {
+            return;
+        }
+        if (suppressNextAutoRefresh) {
+            suppressNextAutoRefresh = false;
+            lastSuggestionValue = value;
+            lastSuggestionCursor = cursor;
+            return;
+        }
+
+        lastSuggestionValue = value;
+        lastSuggestionCursor = cursor;
+        cyclingActive = false;
+
+        int lineStart = value.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1;
+        int lineEndSearch = value.indexOf('\n', cursor);
+        int lineEnd = lineEndSearch < 0 ? value.length() : lineEndSearch;
+        String line = value.substring(lineStart, lineEnd);
+        int cursorInLine = cursor - lineStart;
+        currentLineStart = lineStart;
+
+        if (line.isBlank()) {
+            pendingSuggestions = null;
+            currentSuggestions = List.of();
+            suggestionIndex = 0;
+            return;
+        }
+
+        StringReader reader = new StringReader(line);
+        if (reader.canRead() && reader.peek() == '/') {
+            reader.skip();
+        }
+
+        CommandDispatcher<ClientSuggestionProvider> dispatcher = this.minecraft.player.connection.getCommands();
+        ParseResults<ClientSuggestionProvider> parse = dispatcher.parse(reader, this.minecraft.player.connection.getSuggestionsProvider());
+
+        // Brigadier can't locate a suggestion context before the point it actually parsed to
+        // (throws IllegalStateException) — only ask once the cursor has reached that point.
+        if (cursorInLine < reader.getCursor()) {
+            pendingSuggestions = null;
+            currentSuggestions = List.of();
+            suggestionIndex = 0;
+            return;
+        }
+
+        CompletableFuture<Suggestions> future = dispatcher.getCompletionSuggestions(parse, cursorInLine);
+        pendingSuggestions = future;
+        future.thenAccept(result -> {
+            if (pendingSuggestions == future) {
+                currentSuggestions = result.getList();
+                suggestionIndex = 0;
+            }
+        });
+    }
+
+    private void clearSuggestions() {
+        pendingSuggestions = null;
+        currentSuggestions = List.of();
+        suggestionIndex = 0;
+        cyclingActive = false;
+        lastSuggestionValue = null;
+        lastSuggestionCursor = -1;
+    }
+
+    private void acceptSuggestion() {
+        int index = cyclingActive ? (suggestionIndex + 1) % currentSuggestions.size() : 0;
+        Suggestion suggestion = currentSuggestions.get(index);
+
+        int absoluteStart = cyclingActive ? cycleAbsoluteStart : currentLineStart + suggestion.getRange().getStart();
+        int absoluteEnd = cyclingActive ? cycleAbsoluteStart + cycleInsertedLength : currentLineStart + suggestion.getRange().getEnd();
+
+        editModel.seekCursor(Whence.ABSOLUTE, absoluteStart);
+        editModel.setSelecting(true);
+        editModel.seekCursor(Whence.ABSOLUTE, absoluteEnd);
+        editModel.insertText(suggestion.getText());
+        editModel.setSelecting(false);
+
+        suggestionIndex = index;
+        cyclingActive = true;
+        cycleAbsoluteStart = absoluteStart;
+        cycleInsertedLength = suggestion.getText().length();
+        suppressNextAutoRefresh = true;
     }
 
     @Override
@@ -149,7 +307,7 @@ public final class BatchCommandScreen extends Screen {
         graphics.centeredText(this.font, this.title, this.width / 2, 14, 0xFFFFFFFF);
 
         int editorBottom = commandBox.getBottom();
-        int infoY = editorBottom + 9;
+        int infoY = editorBottom + this.font.lineHeight + 9;
 
         graphics.text(this.font, "Delay:", commandBox.getX(), infoY, 0xFFFFFFFF, true);
         graphics.text(this.font, "ticks", commandBox.getX() + 108, infoY, 0xFFBBBBBB, false);
@@ -174,6 +332,8 @@ public final class BatchCommandScreen extends Screen {
             int right = commandBox.getRight();
             graphics.fill(left, nextY - 3, right, nextY + this.font.lineHeight + 3, 0xA0604A00);
             graphics.text(this.font, trimToWidth(full, right - left - 8), left + 4, nextY, 0xFFFFFF55, true);
+        } else if (!currentSuggestions.isEmpty()) {
+            renderSuggestions(graphics, nextY);
         } else {
             graphics.text(this.font, "Next: none", commandBox.getX(), nextY, 0xFFAAAAAA, false);
         }
@@ -185,6 +345,27 @@ public final class BatchCommandScreen extends Screen {
             String error = "Error: " + CommandBatchRunner.lastError();
             graphics.text(this.font, trimToWidth(error, commandBox.getWidth()), commandBox.getX(), nextY + 16, 0xFFFF7777, true);
         }
+    }
+
+    private void renderSuggestions(GuiGraphicsExtractor graphics, int nextY) {
+        MutableComponent line = Component.empty();
+        int shown = Math.min(currentSuggestions.size(), MAX_SUGGESTIONS_SHOWN);
+        for (int i = 0; i < shown; i++) {
+            if (i > 0) {
+                line.append(Component.literal("  "));
+            }
+            ChatFormatting color = i == suggestionIndex ? ChatFormatting.YELLOW : ChatFormatting.GRAY;
+            line.append(Component.literal(currentSuggestions.get(i).getText()).withStyle(color));
+        }
+        if (currentSuggestions.size() > shown) {
+            line.append(Component.literal(" …").withStyle(ChatFormatting.DARK_GRAY));
+        }
+        line.append(Component.literal("  [Tab]").withStyle(ChatFormatting.DARK_GRAY));
+
+        int left = commandBox.getX();
+        int right = commandBox.getRight();
+        graphics.fill(left, nextY - 3, right, nextY + this.font.lineHeight + 3, 0xA0304050);
+        graphics.text(this.font, line, left + 4, nextY, 0xFFFFFFFF, true);
     }
 
     private int statusColor() {
