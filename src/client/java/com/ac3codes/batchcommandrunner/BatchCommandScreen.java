@@ -56,8 +56,13 @@ public final class BatchCommandScreen extends Screen {
         int infoY = top + editorHeight + 9;
         delayBox = new EditBox(this.font, margin + 48, infoY - 5, 55, 18, Component.literal("Delay ticks"));
         delayBox.setValue(savedDelay);
-        delayBox.setFilter(value -> value.isEmpty() || value.matches("\\d{0,6}"));
-        delayBox.setResponder(value -> savedDelay = value);
+        delayBox.setResponder(value -> {
+            if (value.isEmpty() || value.matches("\\d{0,6}")) {
+                savedDelay = value;
+            } else {
+                delayBox.setValue(savedDelay);
+            }
+        });
         this.addRenderableWidget(delayBox);
 
         int buttonY = this.height - 28;
@@ -141,7 +146,7 @@ public final class BatchCommandScreen extends Screen {
     public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
         super.extractRenderState(graphics, mouseX, mouseY, delta);
 
-        graphics.centeredText(this.font, this.title, this.width / 2, 14, 0xFFFFFFFF, true);
+        graphics.centeredText(this.font, this.title, this.width / 2, 14, 0xFFFFFFFF);
 
         int editorBottom = commandBox.getBottom();
         int infoY = editorBottom + 9;
@@ -205,7 +210,7 @@ public final class BatchCommandScreen extends Screen {
     public void onClose() {
         savedText = commandBox.getValue();
         savedDelay = delayBox.getValue();
-        this.minecraft.setScreen(parent);
+        this.minecraft.setScreenAndShow(parent);
     }
 
     @Override

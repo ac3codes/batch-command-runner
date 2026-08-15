@@ -6,7 +6,7 @@ Client-side Fabric mod for Minecraft Java 26.2.
 
 ## Features
 
-- Press **B** (configurable in Controls) to open the UI.
+- Press **/** (configurable in Controls) to open the UI.
 - Large multiline, scrollable, wrapping command box.
 - Paste one command per line.
 - Leading `/` is optional.
