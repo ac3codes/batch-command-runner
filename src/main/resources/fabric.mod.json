@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "batch_command_runner",
+  "version": "${version}",
+  "name": "Batch Command Runner",
+  "description": "Paste multiple Minecraft commands and execute them sequentially with configurable delays.",
+  "authors": ["Ac3"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.ac3codes.batchcommandrunner.BatchCommandRunnerClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "~26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

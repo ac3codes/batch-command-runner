@@ -1,0 +1,15 @@
+# Gradle
+.gradle/
+build/
+out/
+
+# Minecraft dev run directory (saves, logs, configs, crash reports)
+run/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
