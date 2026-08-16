@@ -3,9 +3,12 @@ package com.ac3codes.batchcommandrunner;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.ParseResults;
 import com.mojang.brigadier.StringReader;
+import com.mojang.brigadier.context.CommandContextBuilder;
+import com.mojang.brigadier.context.ParsedCommandNode;
 import com.mojang.brigadier.suggestion.Suggestion;
 import com.mojang.brigadier.suggestion.Suggestions;
-import net.minecraft.ChatFormatting;
+import com.mojang.brigadier.tree.CommandNode;
+import com.mojang.logging.LogUtils;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
@@ -14,43 +17,81 @@ import net.minecraft.client.gui.components.MultilineTextField;
 import net.minecraft.client.gui.components.Whence;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.multiplayer.ClientSuggestionProvider;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.MutableComponent;
+import org.slf4j.Logger;
 
 import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
+import java.util.Map;
+import java.util.Set;
 
 public final class BatchCommandScreen extends Screen {
-    private static final int MAX_SUGGESTIONS_SHOWN = 6;
+    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final String[] MINIMUM_LABELS = {"Fill:", "Clone:", "Place:", "Summon:"};
+    private static final int MINIMUM_BOX_WIDTH = 34;
+    private static final int MINIMUM_GROUP_GAP = 14;
 
     private static String savedText = "";
-    private static String savedDelay = "1";
+    private static BatchSettings savedSettings = BatchConfig.load();
+    private static String savedDelayText = String.valueOf(savedSettings.normalDelay());
+    private static String savedFillMinimumText = String.valueOf(savedSettings.fillMinimum());
+    private static String savedCloneMinimumText = String.valueOf(savedSettings.cloneMinimum());
+    private static String savedPlaceMinimumText = String.valueOf(savedSettings.placeMinimum());
+    private static String savedSummonMinimumText = String.valueOf(savedSettings.summonMinimum());
+    private static boolean heavyProtectionEnabled = savedSettings.heavyCommandProtection();
 
     private final Screen parent;
 
     private MultiLineEditBox commandBox;
     private EditBox delayBox;
+    private EditBox fillMinimumBox;
+    private EditBox cloneMinimumBox;
+    private EditBox placeMinimumBox;
+    private EditBox summonMinimumBox;
+    private Button heavyProtectionButton;
+    private Button expandMinimumsButton;
+    private Button slashPriorityButton;
+    // Collapsed by default: the four per-type minimum fields are secondary tuning, not
+    // something that needs to be visible (and competing for space) every time the screen opens.
+    private boolean minimumsExpanded;
     private Button runButton;
     private Button stopButton;
     private Button clearButton;
 
     private int parsedCommandCount;
+    // Maps a started batch's entry index to the raw (\n-delimited) line number it came from in
+    // the editor text, since blank/comment lines are skipped when building entries and so don't
+    // line up 1:1 with them. Computed once when Run is pressed; used to highlight/scroll to the
+    // line currently executing.
+    private int[] entryLineNumbers = new int[0];
+    // Raw line numbers whose command isn't something that could actually run - only recomputed
+    // on an Enter press or a Run press (never live while typing), and cleared immediately on any
+    // edit; used both to highlight them red in the editor and to skip them when Run is pressed
+    // (see keyPressed/runCommands/computeInvalidLineNumbers).
+    private Set<Integer> invalidLineNumbers = Set.of();
 
-    // Backing model of commandBox, unwrapped via reflection since MultiLineEditBox exposes
-    // no public cursor/line API of its own — needed to drive command-suggestion lookups.
+    // Backing model of commandBox, unwrapped via reflection since MultiLineEditBox exposes no
+    // public cursor/line API of its own. Extracted once here (not per-tick/per-frame) - see
+    // extractTextField() for why this is still the least fragile option available.
     private MultilineTextField editModel;
-    private List<Suggestion> currentSuggestions = List.of();
-    private int suggestionIndex;
-    private int currentLineStart;
-    private CompletableFuture<Suggestions> pendingSuggestions;
+
+    private final SuggestionPopup suggestionPopup = new SuggestionPopup();
+    private AutocompleteUtil.LineContext currentLineContext;
     private String lastSuggestionValue;
     private int lastSuggestionCursor = -1;
-    private boolean cyclingActive;
-    private int cycleAbsoluteStart;
-    private int cycleInsertedLength;
-    private boolean suppressNextAutoRefresh;
+    // Bumped every time suggestions are requested or invalidated; an async result is only
+    // applied if this hasn't moved since its request went out, so a slow response for an old
+    // keystroke can never clobber what's currently on screen.
+    private long suggestionGeneration;
+    // Faded "what comes next" preview (e.g. typing "minecraft:dirt_block" shows " <count>" right
+    // after it) shown inline after the cursor, built from Brigadier's own getSmartUsage() off
+    // the same parse used for the suggestion popup. Empty when there's nothing to show.
+    private String ghostHintText = "";
 
     public BatchCommandScreen(Screen parent) {
         super(Component.literal("Batch Command Runner"));
@@ -61,7 +102,7 @@ public final class BatchCommandScreen extends Screen {
     protected void init() {
         int margin = Math.max(16, this.width / 16);
         int top = 38;
-        int footerHeight = 94;
+        int footerHeight = 158;
         int editorWidth = Math.max(220, this.width - margin * 2);
         int editorHeight = Math.max(90, this.height - top - footerHeight);
 
@@ -77,41 +118,100 @@ public final class BatchCommandScreen extends Screen {
         commandBox.setValue(savedText, true);
         commandBox.setValueListener(value -> {
             savedText = value;
-            parsedCommandCount = CommandBatchRunner.parseCommands(value).size();
-            if (!CommandBatchRunner.isRunning() && CommandBatchRunner.status() != CommandBatchRunner.Status.IDLE) {
+            parsedCommandCount = CommandUtils.countCommands(value);
+            // Red highlights are deliberately NOT recomputed live here - they only reflect the
+            // state as of the last Enter press or Run press (see keyPressed/runCommands), and
+            // editing a line makes its old red highlight vanish immediately rather than staying
+            // stale until the next check.
+            invalidLineNumbers = Set.of();
+            // Editing the command list while paused is the only way to fully terminate a batch
+            // now that Stop/Resume are one button - there is no going back to Resume afterward.
+            if (CommandBatchRunner.status() == BatchRunnerState.Status.PAUSED) {
+                CommandBatchRunner.stop();
+            }
+            if (!CommandBatchRunner.isActive() && CommandBatchRunner.status() != BatchRunnerState.Status.IDLE) {
                 CommandBatchRunner.reset();
             }
         });
-        parsedCommandCount = CommandBatchRunner.parseCommands(savedText).size();
+        parsedCommandCount = CommandUtils.countCommands(savedText);
         this.addRenderableWidget(commandBox);
         this.editModel = extractTextField(commandBox);
-        clearSuggestions();
+        hideSuggestions();
 
-        // Extra clearance below the box's own built-in "X / Y characters" decoration
-        // (rendered by MultiLineEditBox itself just under its bottom edge).
-        int infoY = top + editorHeight + this.font.lineHeight + 9;
-        delayBox = new EditBox(this.font, margin + 48, infoY - 5, 55, 18, Component.literal("Delay ticks"));
-        delayBox.setValue(savedDelay);
+        int settingsY = top + editorHeight + this.font.lineHeight + 9;
+        int minimumsY = settingsY + 22;
+
+        delayBox = new EditBox(this.font, margin + 48, settingsY - 5, 50, 18, Component.literal("Delay ticks"));
+        delayBox.setValue(savedDelayText);
         delayBox.setResponder(value -> {
-            if (value.isEmpty() || value.matches("\\d{0,6}")) {
-                savedDelay = value;
+            if (value.isEmpty() || value.matches("\\d{0,4}")) {
+                savedDelayText = value;
             } else {
-                delayBox.setValue(savedDelay);
+                delayBox.setValue(savedDelayText);
             }
         });
         this.addRenderableWidget(delayBox);
 
+        // Sized from the longer of "ON"/"OFF" so the button never changes width when toggled,
+        // and everything placed after it (the expand arrow, "Commands: N") has a stable anchor.
+        int heavyButtonWidth = this.font.width("Heavy Protection: OFF") + 16;
+        int heavyButtonX = margin + 48 + 50 + 20;
+        heavyProtectionButton = Button.builder(heavyProtectionLabel(), btn -> toggleHeavyProtection())
+                .bounds(heavyButtonX, settingsY - 5, heavyButtonWidth, 18)
+                .build();
+        this.addRenderableWidget(heavyProtectionButton);
+
+        expandMinimumsButton = Button.builder(expandMinimumsLabel(), btn -> toggleMinimumsExpanded())
+                .bounds(heavyButtonX + heavyButtonWidth + 4, settingsY - 5, 18, 18)
+                .build();
+        this.addRenderableWidget(expandMinimumsButton);
+
+        // Fixed slot reserved right after the expand button regardless of whether it's currently
+        // visible (Heavy Protection off hides it) - simplest way to keep this button's position
+        // stable without needing to reposition it at runtime.
+        int slashButtonWidth = this.font.width("Slash: Vanilla") + 16;
+        int slashButtonX = heavyButtonX + heavyButtonWidth + 4 + 18 + 4;
+        slashPriorityButton = Button.builder(slashPriorityLabel(), btn -> toggleSlashPriority())
+                .bounds(slashButtonX, settingsY - 5, slashButtonWidth, 18)
+                .build();
+        this.addRenderableWidget(slashPriorityButton);
+
+        int[] minimumLabelX = minimumLabelX(margin);
+        fillMinimumBox = new EditBox(this.font, minimumLabelX[0] + this.font.width(MINIMUM_LABELS[0]) + 4, minimumsY - 5, MINIMUM_BOX_WIDTH, 18, Component.literal("Fill minimum ticks"));
+        cloneMinimumBox = new EditBox(this.font, minimumLabelX[1] + this.font.width(MINIMUM_LABELS[1]) + 4, minimumsY - 5, MINIMUM_BOX_WIDTH, 18, Component.literal("Clone minimum ticks"));
+        placeMinimumBox = new EditBox(this.font, minimumLabelX[2] + this.font.width(MINIMUM_LABELS[2]) + 4, minimumsY - 5, MINIMUM_BOX_WIDTH, 18, Component.literal("Place minimum ticks"));
+        summonMinimumBox = new EditBox(this.font, minimumLabelX[3] + this.font.width(MINIMUM_LABELS[3]) + 4, minimumsY - 5, MINIMUM_BOX_WIDTH, 18, Component.literal("Summon minimum ticks"));
+
+        fillMinimumBox.setValue(savedFillMinimumText);
+        cloneMinimumBox.setValue(savedCloneMinimumText);
+        placeMinimumBox.setValue(savedPlaceMinimumText);
+        summonMinimumBox.setValue(savedSummonMinimumText);
+
+        fillMinimumBox.setResponder(value -> savedFillMinimumText = sanitizeTicks(value, fillMinimumBox, savedFillMinimumText));
+        cloneMinimumBox.setResponder(value -> savedCloneMinimumText = sanitizeTicks(value, cloneMinimumBox, savedCloneMinimumText));
+        placeMinimumBox.setResponder(value -> savedPlaceMinimumText = sanitizeTicks(value, placeMinimumBox, savedPlaceMinimumText));
+        summonMinimumBox.setResponder(value -> savedSummonMinimumText = sanitizeTicks(value, summonMinimumBox, savedSummonMinimumText));
+
+        this.addRenderableWidget(fillMinimumBox);
+        this.addRenderableWidget(cloneMinimumBox);
+        this.addRenderableWidget(placeMinimumBox);
+        this.addRenderableWidget(summonMinimumBox);
+
         int buttonY = this.height - 28;
-        int buttonWidth = 92;
-        int gap = 8;
+        int buttonWidth = 84;
+        int gap = 6;
         int totalWidth = buttonWidth * 3 + gap * 2;
         int buttonX = (this.width - totalWidth) / 2;
 
         clearButton = Button.builder(Component.literal("Clear"), btn -> clearEditor())
                 .bounds(buttonX, buttonY, buttonWidth, 20)
                 .build();
-        stopButton = Button.builder(Component.literal("Stop"), btn -> CommandBatchRunner.stop())
-                .bounds(buttonX + buttonWidth + gap, buttonY, buttonWidth, 20)
+        // Stop/Resume is a single button: pressing it while running pauses the batch (and the
+        // label switches to "Resume"); pressing it again resumes. There is no separate hard-stop
+        // action anymore - editing the command list while paused is what fully terminates the
+        // batch (see the commandBox value listener), matching the requested Stop/Resume model.
+        stopButton = Button.builder(Component.literal("Stop"), btn -> onStopResumePressed())
+                .bounds(buttonX + (buttonWidth + gap), buttonY, buttonWidth, 20)
                 .build();
         runButton = Button.builder(Component.literal("Run Commands"), btn -> runCommands())
                 .bounds(buttonX + (buttonWidth + gap) * 2, buttonY, buttonWidth, 20)
@@ -125,92 +225,407 @@ public final class BatchCommandScreen extends Screen {
         this.setInitialFocus(commandBox);
     }
 
+    /** Shared x-position layout for the four minimum-delay label+box groups (Fill/Clone/Place/
+     * Summon), measured against the current font so labels of different widths never overlap.
+     * Used from both {@link #init()} (to place the boxes) and the renderer (to draw the labels
+     * at matching positions), so the two can't drift apart. */
+    private int[] minimumLabelX(int startX) {
+        int[] x = new int[MINIMUM_LABELS.length];
+        int cursor = startX;
+        for (int i = 0; i < MINIMUM_LABELS.length; i++) {
+            x[i] = cursor;
+            cursor += this.font.width(MINIMUM_LABELS[i]) + 4 + MINIMUM_BOX_WIDTH + MINIMUM_GROUP_GAP;
+        }
+        return x;
+    }
+
+    private static String sanitizeTicks(String value, EditBox box, String previous) {
+        if (value.isEmpty() || value.matches("\\d{0,3}")) {
+            return value;
+        }
+        box.setValue(previous);
+        return previous;
+    }
+
+    /**
+     * MultiLineEditBox stores its MultilineTextField (cursor/line/selection model) in a
+     * private field with no accessor, and this Minecraft version exposes no public alternative
+     * for cursor position or line data. A narrowly-scoped accessor mixin would work too, but
+     * for a single field read once at screen-init time, reflection is the smaller footprint -
+     * it needs no mixin plugin wiring and fails safely (see below) if a future Minecraft
+     * update ever renames the field, instead of hard-crashing mod loading.
+     */
     private static MultilineTextField extractTextField(MultiLineEditBox box) {
         try {
             Field field = MultiLineEditBox.class.getDeclaredField("textField");
             field.setAccessible(true);
             return (MultilineTextField) field.get(box);
         } catch (ReflectiveOperationException e) {
-            throw new RuntimeException(e);
+            LOGGER.error("[BatchCommandRunner] Could not access MultiLineEditBox's text field; autocomplete will be unavailable.", e);
+            return null;
         }
     }
 
     private void runCommands() {
-        List<String> commands = CommandBatchRunner.parseCommands(commandBox.getValue());
-        if (commands.isEmpty()) {
+        String text = commandBox.getValue();
+        // Recomputed fresh rather than trusting the live-updated field, so a stale value can
+        // never sneak an invalid command into the batch.
+        invalidLineNumbers = computeInvalidLineNumbers(text);
+
+        List<BatchEntry> allEntries = CommandUtils.parseEntries(text);
+        int[] allLineNumbers = computeEntryLineNumbers(text);
+
+        List<BatchEntry> entries = new ArrayList<>(allEntries.size());
+        int[] validLineNumbers = new int[allEntries.size()];
+        int validCount = 0;
+        for (int i = 0; i < allEntries.size(); i++) {
+            if (!invalidLineNumbers.contains(allLineNumbers[i])) {
+                entries.add(allEntries.get(i));
+                validLineNumbers[validCount++] = allLineNumbers[i];
+            }
+        }
+        int skippedCount = allEntries.size() - entries.size();
+
+        if (entries.isEmpty()) {
             CommandBatchRunner.reset();
             return;
         }
-
-        int delay = 1;
-        try {
-            if (!delayBox.getValue().isBlank()) {
-                delay = Integer.parseInt(delayBox.getValue());
-            }
-        } catch (NumberFormatException ignored) {
-            delay = 1;
+        entryLineNumbers = Arrays.copyOf(validLineNumbers, validCount);
+        if (skippedCount > 0) {
+            LOGGER.info("[BatchCommandRunner] Skipping {} invalid command(s) before starting batch", skippedCount);
         }
-        delay = Math.max(0, Math.min(1_000_000, delay));
-        savedDelay = Integer.toString(delay);
-        delayBox.setValue(savedDelay);
 
-        savedText = commandBox.getValue();
-        CommandBatchRunner.start(commands, delay);
+        BatchSettings settings = readSettingsFromUi();
+        applySettingsToUi(settings);
+        savedText = text;
+        BatchConfig.save(settings);
+
+        // Starting a run hides the minimums panel even if it was left open - it can be reopened
+        // with the expand button at any time, including while the batch is active.
+        minimumsExpanded = false;
+        expandMinimumsButton.setMessage(expandMinimumsLabel());
+
+        CommandBatchRunner.start(entries, settings);
         updateWidgetStates();
     }
 
+    /** Mirrors {@link CommandUtils#parseEntries}'s blank/comment/empty-after-slash filtering, so
+     * {@code entryLineNumbers[i]} always names the correct raw line for {@code entries.get(i)}. */
+    private static int[] computeEntryLineNumbers(String text) {
+        if (text == null || text.isBlank()) {
+            return new int[0];
+        }
+        String[] rawLines = text.split("\\R", -1);
+        int[] buffer = new int[rawLines.length];
+        int count = 0;
+        for (int i = 0; i < rawLines.length; i++) {
+            String rawLine = rawLines[i];
+            if (CommandUtils.isBlankOrComment(rawLine)) {
+                continue;
+            }
+            if (!CommandUtils.stripLeadingSlash(rawLine).isEmpty()) {
+                buffer[count++] = i;
+            }
+        }
+        return Arrays.copyOf(buffer, count);
+    }
+
+    /**
+     * Raw line numbers whose command is not something that could actually be run as-is: either
+     * it doesn't fully parse against Minecraft's own command tree (unparsed leftover input -
+     * the same signal vanilla's own chat input box uses to color invalid command text red, see
+     * {@code CommandSuggestions.formatText}), or it parses but stops short of a node that's
+     * actually executable (a required argument is still missing). The latter is checked via
+     * {@code getContext().getLastChild().getCommand() == null}, which is safe even for commands
+     * this mod doesn't implement locally: the client's own command tree attaches a dummy
+     * executor to every server-marked-executable node when it's built from the server's
+     * {@code ClientboundCommandsPacket} (see {@code ClientPacketListener.COMMAND_NODE_BUILDER}),
+     * so this reflects the server's own notion of "complete", not just vanilla's built-ins.
+     * Returns an empty set (rather than guessing) when there's no live connection to validate
+     * against yet.
+     */
+    private Set<Integer> computeInvalidLineNumbers(String text) {
+        if (text == null || text.isBlank() || this.minecraft == null || this.minecraft.player == null
+                || this.minecraft.player.connection == null) {
+            return Set.of();
+        }
+
+        CommandDispatcher<ClientSuggestionProvider> dispatcher = this.minecraft.player.connection.getCommands();
+        ClientSuggestionProvider source = this.minecraft.player.connection.getSuggestionsProvider();
+
+        Set<Integer> invalid = new HashSet<>();
+        String[] rawLines = text.split("\\R", -1);
+        for (int i = 0; i < rawLines.length; i++) {
+            String rawLine = rawLines[i];
+            if (CommandUtils.isBlankOrComment(rawLine)) {
+                continue;
+            }
+            String normalized = CommandUtils.stripLeadingSlash(rawLine);
+            if (normalized.isEmpty()) {
+                continue;
+            }
+            ParseResults<ClientSuggestionProvider> parse = dispatcher.parse(normalized, source);
+            boolean unparsedLeftover = parse.getReader().canRead();
+            boolean notExecutable = parse.getContext().getLastChild().getCommand() == null;
+            if (unparsedLeftover || notExecutable) {
+                invalid.add(i);
+            }
+        }
+        return invalid;
+    }
+
+    private BatchSettings readSettingsFromUi() {
+        int normalDelay = parseIntOrDefault(delayBox.getValue(), BatchSettings.DEFAULT.normalDelay());
+        int fillMinimum = parseIntOrDefault(fillMinimumBox.getValue(), BatchSettings.DEFAULT.fillMinimum());
+        int cloneMinimum = parseIntOrDefault(cloneMinimumBox.getValue(), BatchSettings.DEFAULT.cloneMinimum());
+        int placeMinimum = parseIntOrDefault(placeMinimumBox.getValue(), BatchSettings.DEFAULT.placeMinimum());
+        int summonMinimum = parseIntOrDefault(summonMinimumBox.getValue(), BatchSettings.DEFAULT.summonMinimum());
+        return new BatchSettings(normalDelay, heavyProtectionEnabled, fillMinimum, cloneMinimum, placeMinimum, summonMinimum);
+    }
+
+    private static int parseIntOrDefault(String text, int fallback) {
+        if (text == null || text.isBlank()) {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(text.trim());
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
+    }
+
+    private void applySettingsToUi(BatchSettings settings) {
+        savedSettings = settings;
+        savedDelayText = String.valueOf(settings.normalDelay());
+        savedFillMinimumText = String.valueOf(settings.fillMinimum());
+        savedCloneMinimumText = String.valueOf(settings.cloneMinimum());
+        savedPlaceMinimumText = String.valueOf(settings.placeMinimum());
+        savedSummonMinimumText = String.valueOf(settings.summonMinimum());
+        heavyProtectionEnabled = settings.heavyCommandProtection();
+        delayBox.setValue(savedDelayText);
+        fillMinimumBox.setValue(savedFillMinimumText);
+        cloneMinimumBox.setValue(savedCloneMinimumText);
+        placeMinimumBox.setValue(savedPlaceMinimumText);
+        summonMinimumBox.setValue(savedSummonMinimumText);
+        heavyProtectionButton.setMessage(heavyProtectionLabel());
+    }
+
+    private void toggleHeavyProtection() {
+        heavyProtectionEnabled = !heavyProtectionEnabled;
+        if (!heavyProtectionEnabled) {
+            // The expand button is about to be hidden - don't leave the panel stuck open with
+            // no way to close it.
+            minimumsExpanded = false;
+            expandMinimumsButton.setMessage(expandMinimumsLabel());
+        }
+        heavyProtectionButton.setMessage(heavyProtectionLabel());
+        updateWidgetStates();
+        BatchSettings settings = readSettingsFromUi();
+        savedSettings = settings;
+        BatchConfig.save(settings);
+    }
+
+    private static Component heavyProtectionLabel() {
+        return Component.literal("Heavy Protection: " + (heavyProtectionEnabled ? "ON" : "OFF"));
+    }
+
+    /** Whether the batch UI's own "/" keybind wins over vanilla's "Open Command" keybind when
+     * the two happen to be bound to the same key - see {@code BatchCommandRunnerClient} for
+     * where this is actually applied. Persisted independently of {@link BatchSettings} since
+     * it's an unrelated concern (keybind conflict resolution, not batch execution). */
+    private void toggleSlashPriority() {
+        BatchCommandRunnerClient.setBatchSlashPriority(!BatchCommandRunnerClient.isBatchSlashPriority());
+        slashPriorityButton.setMessage(slashPriorityLabel());
+    }
+
+    private static Component slashPriorityLabel() {
+        return Component.literal("Slash: " + (BatchCommandRunnerClient.isBatchSlashPriority() ? "Batch" : "Vanilla"));
+    }
+
+    private void toggleMinimumsExpanded() {
+        minimumsExpanded = !minimumsExpanded;
+        expandMinimumsButton.setMessage(expandMinimumsLabel());
+        updateWidgetStates();
+    }
+
+    private Component expandMinimumsLabel() {
+        return Component.literal(minimumsExpanded ? "^" : "v");
+    }
+
     private void clearEditor() {
-        if (CommandBatchRunner.isRunning()) {
+        if (CommandBatchRunner.isActive()) {
             return;
         }
         savedText = "";
         commandBox.setValue("");
         parsedCommandCount = 0;
+        invalidLineNumbers = Set.of();
         CommandBatchRunner.reset();
-        clearSuggestions();
+        hideSuggestions();
     }
 
     private void updateWidgetStates() {
         if (commandBox == null) {
             return;
         }
-        boolean running = CommandBatchRunner.isRunning();
-        commandBox.active = !running;
-        delayBox.active = !running;
-        clearButton.active = !running;
-        runButton.active = !running && parsedCommandCount > 0;
-        stopButton.active = running;
+        BatchRunnerState.Status status = CommandBatchRunner.status();
+        boolean active = CommandBatchRunner.isActive();
+        boolean paused = status == BatchRunnerState.Status.PAUSED;
+
+        // Locked for the entire time a batch is active (RUNNING or PAUSED): the queued batch is
+        // already snapshotted and entryLineNumbers was computed against the text as it stood at
+        // Run time, so editing during PAUSED would desync the two. Editing while paused is still
+        // how a batch gets fully terminated (see the value listener) - it just has to happen
+        // after Stop/Resume brings the batch back to inactive first.
+        commandBox.active = !active;
+        delayBox.active = !active;
+        fillMinimumBox.active = !active;
+        fillMinimumBox.visible = minimumsExpanded;
+        cloneMinimumBox.active = !active;
+        cloneMinimumBox.visible = minimumsExpanded;
+        placeMinimumBox.active = !active;
+        placeMinimumBox.visible = minimumsExpanded;
+        summonMinimumBox.active = !active;
+        summonMinimumBox.visible = minimumsExpanded;
+        heavyProtectionButton.active = !active;
+        // The expand toggle (and by extension the minimums panel it reveals) is only meaningful
+        // while Heavy Command Protection is actually on.
+        expandMinimumsButton.visible = heavyProtectionEnabled;
+        // Only relevant - and only shown - while the batch UI's own "/" key and vanilla's "Open
+        // Command" key actually collide; with different keys there's nothing to prioritize.
+        slashPriorityButton.visible = BatchCommandRunnerClient.isSlashConflict();
+        slashPriorityButton.active = !active;
+        clearButton.active = !active;
+        runButton.active = !active && parsedCommandCount > 0;
+        stopButton.active = active;
+        stopButton.setMessage(Component.literal(paused ? "Resume" : "Stop"));
+    }
+
+    /** The single Stop/Resume button: pauses a running batch, or resumes a paused one. There is
+     * no separate hard-stop anymore - see the commandBox value listener for how a batch is now
+     * fully terminated (editing the list while paused). */
+    private void onStopResumePressed() {
+        if (CommandBatchRunner.status() == BatchRunnerState.Status.PAUSED) {
+            CommandBatchRunner.resume();
+        } else {
+            CommandBatchRunner.pause();
+        }
     }
 
     @Override
     public void tick() {
         super.tick();
-        parsedCommandCount = CommandBatchRunner.parseCommands(commandBox.getValue()).size();
         updateWidgetStates();
-        updateSuggestions();
+        refreshSuggestionsIfNeeded();
+        scrollToCurrentLineIfNeeded();
+    }
+
+    /**
+     * While a batch is running or paused, keeps the next pending line scrolled into view - the
+     * editor is otherwise non-interactive during that time (locked while active; editing to
+     * terminate requires stopping/resuming first), so the user has no other way to bring it back
+     * on screen. Only scrolls when the line isn't already visible, so it doesn't fight a still-
+     * scrollable view once the line is already on screen. Uses the same raw-line approximation
+     * as the autocomplete popup's positioning (see {@link #suggestionAnchor}) for the same
+     * reason - MultiLineEditBox's actual word-wrapped row layout isn't accessible from outside
+     * its package.
+     */
+    private void scrollToCurrentLineIfNeeded() {
+        if (!CommandBatchRunner.isActive()) {
+            return;
+        }
+        int entryIndex = CommandBatchRunner.nextEntryIndex();
+        if (entryIndex < 0 || entryIndex >= entryLineNumbers.length) {
+            return;
+        }
+        int lineTop = entryLineNumbers[entryIndex] * 9;
+        double scrollAmount = commandBox.scrollAmount();
+        int viewportHeight = commandBox.getHeight();
+        if (lineTop < scrollAmount) {
+            commandBox.setScrollAmount(lineTop);
+        } else if (lineTop + 9 > scrollAmount + viewportHeight) {
+            commandBox.setScrollAmount(lineTop + 9 - viewportHeight);
+        }
     }
 
     @Override
     public boolean keyPressed(KeyEvent event) {
-        if (event.isCycleFocus() && commandBox.isFocused() && !CommandBatchRunner.isRunning() && !currentSuggestions.isEmpty()) {
-            acceptSuggestion();
-            return true;
+        if (suggestionPopup.isVisible() && commandBox.isFocused() && !CommandBatchRunner.isActive()) {
+            if (event.isUp()) {
+                suggestionPopup.moveSelection(-1);
+                return true;
+            }
+            if (event.isDown()) {
+                suggestionPopup.moveSelection(1);
+                return true;
+            }
+            if (event.isCycleFocus()) {
+                acceptSuggestion();
+                return true;
+            }
+            if (event.isEscape()) {
+                // Hide the popup, but deliberately don't consume the key here - fall through so
+                // the same Escape press also closes the screen (matching normal vanilla Escape
+                // behavior), instead of requiring a separate second press just to leave the UI.
+                hideSuggestions();
+            }
         }
+
         // hasControlDownWithQuirk() resolves to Cmd on macOS and Ctrl elsewhere, matching
         // the modifier Minecraft already uses for its own copy/paste/select-all shortcuts.
-        if ((event.key() == 257 || event.key() == 335) && event.hasControlDownWithQuirk()) {
+        boolean isEnter = event.key() == 257 || event.key() == 335;
+        if (isEnter && event.hasControlDownWithQuirk()) {
             if (runButton.active) {
                 runCommands();
             }
             return true;
         }
-        return super.keyPressed(event);
+
+        boolean handled = super.keyPressed(event);
+        // A plain Enter (no Ctrl) just inserted a newline into the editor above - re-check red
+        // highlights now that a line has been "committed", per the same on-Enter-or-Run trigger
+        // Run itself already uses (see runCommands).
+        if (isEnter && commandBox.isFocused()) {
+            invalidLineNumbers = computeInvalidLineNumbers(commandBox.getValue());
+        }
+        return handled;
     }
 
-    private void updateSuggestions() {
+    @Override
+    public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        if (suggestionPopup.isVisible()) {
+            if (suggestionPopup.isMouseOver(event.x(), event.y())) {
+                Suggestion clicked = suggestionPopup.rowAt(event.x(), event.y());
+                if (clicked != null) {
+                    acceptSuggestion();
+                }
+                return true;
+            }
+            hideSuggestions();
+        }
+        return super.mouseClicked(event, doubleClick);
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        if (suggestionPopup.isVisible() && suggestionPopup.isMouseOver(mouseX, mouseY)) {
+            suggestionPopup.scroll(scrollY);
+            return true;
+        }
+        return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+    }
+
+    /**
+     * Refreshes suggestions only when the current line or cursor position actually changed
+     * since the last check. {@code editModel.value()} returns the same String instance when
+     * nothing has been edited, so the equality check below is a cheap reference comparison in
+     * the overwhelmingly common case of "nothing changed this tick" - this is what keeps
+     * suggestion lookups from re-running 20 times a second on an idle editor.
+     */
+    private void refreshSuggestionsIfNeeded() {
         if (editModel == null || this.minecraft == null || this.minecraft.player == null
-                || CommandBatchRunner.isRunning() || !commandBox.isFocused()) {
-            clearSuggestions();
+                || this.minecraft.player.connection == null || CommandBatchRunner.isActive() || !commandBox.isFocused()) {
+            hideSuggestions();
             return;
         }
 
@@ -219,158 +634,345 @@ public final class BatchCommandScreen extends Screen {
         if (value.equals(lastSuggestionValue) && cursor == lastSuggestionCursor) {
             return;
         }
-        if (suppressNextAutoRefresh) {
-            suppressNextAutoRefresh = false;
-            lastSuggestionValue = value;
-            lastSuggestionCursor = cursor;
-            return;
-        }
-
+        // Deletions (backspace/delete, including deleting a selection) never (re)open the
+        // popup - only typing new characters does. Without this, deleting back through an
+        // accepted suggestion immediately reopens the popup for whatever's left, which reads
+        // as the autocomplete fighting the user rather than helping them.
+        boolean isDeletion = lastSuggestionValue != null && value.length() < lastSuggestionValue.length();
         lastSuggestionValue = value;
         lastSuggestionCursor = cursor;
-        cyclingActive = false;
 
-        int lineStart = value.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1;
-        int lineEndSearch = value.indexOf('\n', cursor);
-        int lineEnd = lineEndSearch < 0 ? value.length() : lineEndSearch;
-        String line = value.substring(lineStart, lineEnd);
-        int cursorInLine = cursor - lineStart;
-        currentLineStart = lineStart;
-
-        if (line.isBlank()) {
-            pendingSuggestions = null;
-            currentSuggestions = List.of();
-            suggestionIndex = 0;
+        if (isDeletion) {
+            invalidateSuggestions();
             return;
         }
 
-        StringReader reader = new StringReader(line);
+        AutocompleteUtil.LineContext context = AutocompleteUtil.extractCurrentLine(value, cursor);
+        currentLineContext = context;
+
+        if (context.line().isBlank()) {
+            invalidateSuggestions();
+            return;
+        }
+
+        StringReader reader = new StringReader(context.line());
         if (reader.canRead() && reader.peek() == '/') {
             reader.skip();
         }
 
         CommandDispatcher<ClientSuggestionProvider> dispatcher = this.minecraft.player.connection.getCommands();
-        ParseResults<ClientSuggestionProvider> parse = dispatcher.parse(reader, this.minecraft.player.connection.getSuggestionsProvider());
+        ClientSuggestionProvider source = this.minecraft.player.connection.getSuggestionsProvider();
+        ParseResults<ClientSuggestionProvider> parse = dispatcher.parse(reader, source);
 
         // Brigadier can't locate a suggestion context before the point it actually parsed to
-        // (throws IllegalStateException) — only ask once the cursor has reached that point.
-        if (cursorInLine < reader.getCursor()) {
-            pendingSuggestions = null;
-            currentSuggestions = List.of();
-            suggestionIndex = 0;
+        // (throws IllegalStateException) - only ask once the cursor has reached that point.
+        if (context.cursorInLine() < reader.getCursor()) {
+            invalidateSuggestions();
             return;
         }
 
-        CompletableFuture<Suggestions> future = dispatcher.getCompletionSuggestions(parse, cursorInLine);
-        pendingSuggestions = future;
-        future.thenAccept(result -> {
-            if (pendingSuggestions == future) {
-                currentSuggestions = result.getList();
-                suggestionIndex = 0;
+        ghostHintText = computeGhostHint(dispatcher, parse, context.cursorInLine(), source);
+
+        long generation = ++suggestionGeneration;
+        dispatcher.getCompletionSuggestions(parse, context.cursorInLine()).thenAccept(result -> {
+            if (generation != suggestionGeneration) {
+                return;
             }
+            showSuggestions(result, context, value);
         });
     }
 
-    private void clearSuggestions() {
-        pendingSuggestions = null;
-        currentSuggestions = List.of();
-        suggestionIndex = 0;
-        cyclingActive = false;
+    private void showSuggestions(Suggestions result, AutocompleteUtil.LineContext context, String value) {
+        List<Suggestion> list = result.getList();
+        if (list.isEmpty()) {
+            suggestionPopup.hide();
+            return;
+        }
+        int[] anchor = suggestionAnchor(context, value);
+        suggestionPopup.show(list, anchor[0], anchor[1], this.font, this.width, this.height);
+    }
+
+    /**
+     * Approximates where the cursor sits on screen so the popup can appear near it. This
+     * counts raw ({@code \n}-delimited) lines rather than the editor's internal word-wrapped
+     * display lines - MultiLineEditBox exposes no accessible way to ask "which visual row is
+     * this line on" from outside its package (that type is package-protected), so a very long
+     * single command that wraps onto multiple visual rows may anchor a little high; the popup
+     * still always ends up fully on screen either way thanks to the clamp below.
+     */
+    private int[] suggestionAnchor(AutocompleteUtil.LineContext context, String value) {
+        int[] cursorPos = cursorScreenPos(context, value);
+        if (cursorPos != null) {
+            int lineHeight = this.font.lineHeight + 1;
+            return new int[]{cursorPos[0], cursorPos[1] + lineHeight};
+        }
+        return new int[]{commandBox.getX() + 4, commandBox.getBottom() + 4};
+    }
+
+    /**
+     * Where the cursor currently sits on screen, in the same raw-line approximation used
+     * elsewhere in this class (see {@link #suggestionAnchor}'s own doc for why) - or {@code null}
+     * if that line isn't currently within the visible/scrolled viewport at all. Shared by the
+     * suggestion popup's anchor and the inline ghost-hint text, so the two can never drift apart.
+     */
+    private int[] cursorScreenPos(AutocompleteUtil.LineContext context, String value) {
+        int rawLineNumber = 0;
+        for (int i = 0; i < context.lineStart(); i++) {
+            if (value.charAt(i) == '\n') {
+                rawLineNumber++;
+            }
+        }
+
+        int lineHeight = this.font.lineHeight + 1;
+        int innerPad = 4;
+        double scrollAmount = commandBox.scrollAmount();
+        int firstVisibleLine = (int) (scrollAmount / lineHeight);
+        int relativeLine = rawLineNumber - firstVisibleLine;
+        int approxVisibleRows = Math.max(1, commandBox.getHeight() / lineHeight);
+        if (relativeLine < 0 || relativeLine >= approxVisibleRows) {
+            return null;
+        }
+
+        String textBeforeCursor = context.line().substring(0, Math.min(context.cursorInLine(), context.line().length()));
+        int cursorX = Math.min(this.font.width(textBeforeCursor), Math.max(0, commandBox.getWidth() - innerPad * 2));
+        return new int[]{commandBox.getX() + innerPad + cursorX, commandBox.getY() + innerPad + relativeLine * lineHeight};
+    }
+
+    /**
+     * Draws the faded "what comes next" preview (see {@link #computeGhostHint}) inline right
+     * after the cursor, scissored to the editor's own bounds. Hidden whenever the suggestion
+     * popup is showing, so the two never visually compete for the same spot.
+     */
+    private void renderGhostHint(GuiGraphicsExtractor graphics) {
+        if (ghostHintText.isEmpty() || currentLineContext == null || editModel == null
+                || !commandBox.isFocused() || CommandBatchRunner.isActive() || suggestionPopup.isVisible()) {
+            return;
+        }
+        int[] cursorPos = cursorScreenPos(currentLineContext, editModel.value());
+        if (cursorPos == null) {
+            return;
+        }
+        graphics.enableScissor(commandBox.getX(), commandBox.getY(), commandBox.getRight(), commandBox.getBottom());
+        graphics.text(this.font, ghostHintText, cursorPos[0], cursorPos[1], 0xFF808080, false);
+        graphics.disableScissor();
+    }
+
+    private void invalidateSuggestions() {
+        suggestionGeneration++;
+        suggestionPopup.hide();
+        ghostHintText = "";
+    }
+
+    private void hideSuggestions() {
+        suggestionGeneration++;
+        suggestionPopup.hide();
         lastSuggestionValue = null;
         lastSuggestionCursor = -1;
+        ghostHintText = "";
+    }
+
+    /**
+     * Builds the faded "what comes next" preview text (e.g. "minecraft:dirt_block" -> " <count>")
+     * shown right after the cursor once the token there is fully typed but not yet followed by a
+     * separating space. Only returns something once the cursor sits exactly where Brigadier's
+     * parse actually stopped (not mid-token), and uses {@link CommandDispatcher#getSmartUsage}
+     * off the last matched node - the same node the suggestion popup's own parse arrived at - to
+     * ask what a valid continuation from here would look like.
+     */
+    private String computeGhostHint(CommandDispatcher<ClientSuggestionProvider> dispatcher,
+                                     ParseResults<ClientSuggestionProvider> parse, int cursorInLine,
+                                     ClientSuggestionProvider source) {
+        if (parse.getReader().getCursor() != cursorInLine) {
+            return "";
+        }
+        CommandContextBuilder<ClientSuggestionProvider> ctx = parse.getContext().getLastChild();
+        List<ParsedCommandNode<ClientSuggestionProvider>> nodes = ctx.getNodes();
+        CommandNode<ClientSuggestionProvider> node = nodes.isEmpty() ? ctx.getRootNode() : nodes.get(nodes.size() - 1).getNode();
+        Map<CommandNode<ClientSuggestionProvider>, String> usage = dispatcher.getSmartUsage(node, source);
+        if (usage.isEmpty()) {
+            return "";
+        }
+        // A node can have multiple children (e.g. a literal with several sibling arguments/
+        // branches) - just showing the first is an acceptable simplification for a hint that's
+        // only ever meant as a nudge, not a full breakdown of every possible continuation.
+        String hint = usage.values().iterator().next();
+        return hint.isBlank() ? "" : " " + hint;
     }
 
     private void acceptSuggestion() {
-        int index = cyclingActive ? (suggestionIndex + 1) % currentSuggestions.size() : 0;
-        Suggestion suggestion = currentSuggestions.get(index);
-
-        int absoluteStart = cyclingActive ? cycleAbsoluteStart : currentLineStart + suggestion.getRange().getStart();
-        int absoluteEnd = cyclingActive ? cycleAbsoluteStart + cycleInsertedLength : currentLineStart + suggestion.getRange().getEnd();
-
-        editModel.seekCursor(Whence.ABSOLUTE, absoluteStart);
-        editModel.setSelecting(true);
-        editModel.seekCursor(Whence.ABSOLUTE, absoluteEnd);
-        editModel.insertText(suggestion.getText());
-        editModel.setSelecting(false);
-
-        suggestionIndex = index;
-        cyclingActive = true;
-        cycleAbsoluteStart = absoluteStart;
-        cycleInsertedLength = suggestion.getText().length();
-        suppressNextAutoRefresh = true;
+        Suggestion suggestion = suggestionPopup.selected();
+        if (suggestion == null || editModel == null || currentLineContext == null) {
+            return;
+        }
+        try {
+            AutocompleteUtil.Applied applied = AutocompleteUtil.applySuggestion(
+                    editModel.value(), currentLineContext,
+                    suggestion.getRange().getStart(), suggestion.getRange().getEnd(), suggestion.getText());
+            editModel.setValue(applied.newValue(), true);
+            editModel.seekCursor(Whence.ABSOLUTE, applied.newCursor());
+        } catch (RuntimeException e) {
+            LOGGER.warn("[BatchCommandRunner] Failed to apply autocomplete suggestion.", e);
+        } finally {
+            hideSuggestions();
+        }
     }
 
     @Override
     public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
         super.extractRenderState(graphics, mouseX, mouseY, delta);
+        renderInvalidLineHighlights(graphics);
+        renderCurrentLineHighlight(graphics);
+        renderGhostHint(graphics);
 
         graphics.centeredText(this.font, this.title, this.width / 2, 14, 0xFFFFFFFF);
 
+        // Kept on the title row, right-aligned to the editor's own right edge, deliberately
+        // separate from the settings-button row below - that row is already crowded (Delay,
+        // Heavy Protection, expand arrow, slash-priority toggle) and any width-based clamping
+        // there has repeatedly ended up overlapping one of those buttons in practice.
+        String commandsText = "Commands: " + parsedCommandCount;
+        graphics.text(this.font, commandsText, commandBox.getRight() - this.font.width(commandsText), 14, 0xFFFFFFFF, true);
+
         int editorBottom = commandBox.getBottom();
-        int infoY = editorBottom + this.font.lineHeight + 9;
+        int settingsY = editorBottom + this.font.lineHeight + 9;
+        int minimumsY = settingsY + 22;
 
-        graphics.text(this.font, "Delay:", commandBox.getX(), infoY, 0xFFFFFFFF, true);
-        graphics.text(this.font, "ticks", commandBox.getX() + 108, infoY, 0xFFBBBBBB, false);
+        graphics.text(this.font, "Delay:", commandBox.getX(), settingsY, 0xFFFFFFFF, true);
 
-        int countX = commandBox.getX() + 155;
-        String countText = "Commands: " + parsedCommandCount;
-        graphics.text(this.font, countText, countX, infoY, 0xFFFFFFFF, true);
-
-        String statusText = "Status: " + CommandBatchRunner.status().label();
-        int statusX = this.width - commandBox.getX() - this.font.width(statusText);
-        graphics.text(this.font, statusText, statusX, infoY, statusColor(), true);
-
-        int nextY = infoY + 19;
-        String nextCommand = CommandBatchRunner.nextCommand();
-        if (nextCommand != null) {
-            int nextNumber = CommandBatchRunner.nextCommandNumber();
-            int total = CommandBatchRunner.totalCount();
-            String prefix = "NEXT #" + nextNumber + " / " + total + ": ";
-            String full = prefix + nextCommand;
-
-            int left = commandBox.getX();
-            int right = commandBox.getRight();
-            graphics.fill(left, nextY - 3, right, nextY + this.font.lineHeight + 3, 0xA0604A00);
-            graphics.text(this.font, trimToWidth(full, right - left - 8), left + 4, nextY, 0xFFFFFF55, true);
-        } else if (!currentSuggestions.isEmpty()) {
-            renderSuggestions(graphics, nextY);
-        } else {
-            graphics.text(this.font, "Next: none", commandBox.getX(), nextY, 0xFFAAAAAA, false);
+        if (minimumsExpanded) {
+            int[] minimumLabelX = minimumLabelX(commandBox.getX());
+            for (int i = 0; i < MINIMUM_LABELS.length; i++) {
+                graphics.text(this.font, MINIMUM_LABELS[i], minimumLabelX[i], minimumsY, 0xFFFFFFFF, true);
+            }
         }
 
-        if (CommandBatchRunner.status() == CommandBatchRunner.Status.RUNNING) {
-            String progress = "Completed: " + CommandBatchRunner.completedCount() + " / " + CommandBatchRunner.totalCount();
-            graphics.text(this.font, progress, commandBox.getX(), nextY + 16, 0xFFBBBBBB, false);
-        } else if (CommandBatchRunner.status() == CommandBatchRunner.Status.ERROR) {
-            String error = "Error: " + CommandBatchRunner.lastError();
-            graphics.text(this.font, trimToWidth(error, commandBox.getWidth()), commandBox.getX(), nextY + 16, 0xFFFF7777, true);
+        // When the minimums panel is collapsed (the common case), start the status block right
+        // under the settings row instead of leaving its reserved space empty - this is what
+        // "moves the status area up" when there's nothing else occupying that row.
+        int lineY = (minimumsExpanded ? minimumsY : settingsY) + 20;
+        int left = commandBox.getX();
+        int right = commandBox.getRight();
+
+        BatchRunnerState.Status status = CommandBatchRunner.status();
+        boolean active = status == BatchRunnerState.Status.RUNNING || status == BatchRunnerState.Status.PAUSED;
+
+        // Status, progress, and the countdown all share one line, spread across the full width
+        // (left/right) rather than stacked as separate narrow lines - the Heavy Protection
+        // on/off state is deliberately not repeated here since the toggle button above already
+        // shows it.
+        String statusText = "Status: " + status.label();
+        if (active) {
+            statusText += "  (" + CommandBatchRunner.completedCount() + " / " + CommandBatchRunner.totalCount() + ")";
+        }
+        graphics.text(this.font, statusText, left, lineY, statusColor(), true);
+
+        if (active) {
+            String nextIn = "Next command in: " + CommandBatchRunner.ticksUntilNext() + " ticks";
+            graphics.text(this.font, nextIn, right - this.font.width(nextIn), lineY, 0xFFBBBBBB, false);
+        }
+        lineY += 12;
+
+        int errorCount = invalidLineNumbers.size();
+        String errorsText = "Errors: " + errorCount;
+        graphics.text(this.font, errorsText, left, lineY, errorCount > 0 ? 0xFFFF5555 : 0xFFBBBBBB, true);
+        lineY += 12;
+
+        switch (status) {
+            case RUNNING, PAUSED -> renderNextStatus(graphics, left, right, lineY);
+            case COMPLETED -> graphics.text(this.font, "Completed: " + CommandBatchRunner.completedCount() + " / " + CommandBatchRunner.totalCount() + "   Next: none", left, lineY, 0xFF55FF55, false);
+            case STOPPED -> graphics.text(this.font, "Stopped at " + CommandBatchRunner.completedCount() + " / " + CommandBatchRunner.totalCount(), left, lineY, 0xFFFFAA55, false);
+            case ERROR -> graphics.text(this.font, trimToWidth("Error: " + CommandBatchRunner.lastError(), right - left), left, lineY, 0xFFFF7777, true);
+            case IDLE -> {
+                // Nothing to show while idle - the suggestion popup (if any) renders below.
+            }
+        }
+
+        suggestionPopup.render(graphics, this.font);
+    }
+
+    /** The next command that will actually be sent - not the one most recently sent - with its
+     * type/estimate/protection details folded inline (rather than one line each) - truncated as
+     * a whole if it doesn't fit. The protection/delay figures are recomputed fresh from this
+     * entry rather than read off the runner, since those track the last dispatched entry, not
+     * the upcoming one this line now describes. */
+    private void renderNextStatus(GuiGraphicsExtractor graphics, int left, int right, int lineY) {
+        BatchEntry next = CommandBatchRunner.nextEntry();
+        if (next == null) {
+            graphics.text(this.font, "Next: none", left, lineY, 0xFFEEEEEE, false);
+            return;
+        }
+
+        StringBuilder line = new StringBuilder("Next: ").append(next.command());
+        if (next.type() != CommandType.NORMAL) {
+            line.append("  [").append(next.type());
+            if (next.hasEstimatedWork()) {
+                line.append(", ").append(String.format("%,d", next.estimatedWork())).append(" blocks");
+            }
+            BatchSettings settings = CommandBatchRunner.settings();
+            int effectiveDelay = CommandUtils.calculateEffectiveDelay(next, settings);
+            if (settings.heavyCommandProtection() && effectiveDelay > settings.normalDelay()) {
+                line.append(", +").append(effectiveDelay).append(" ticks");
+            }
+            line.append(']');
+        }
+        graphics.text(this.font, trimToWidth(line.toString(), right - left), left, lineY, 0xFFEEEEEE, false);
+    }
+
+    /**
+     * Draws a light-yellow translucent highlight over the next pending line - not the one most
+     * recently sent - on top of the editor's own already-rendered text (so it reads as a
+     * highlighter mark rather than covering the text). Shown from the moment a batch starts
+     * (entry #1, before anything has actually been sent) through its last wait; gone once the
+     * batch is no longer active. Uses the same raw-line approximation as
+     * {@link #scrollToCurrentLineIfNeeded}.
+     */
+    private void renderCurrentLineHighlight(GuiGraphicsExtractor graphics) {
+        if (!CommandBatchRunner.isActive()) {
+            return;
+        }
+        int entryIndex = CommandBatchRunner.nextEntryIndex();
+        if (entryIndex < 0 || entryIndex >= entryLineNumbers.length) {
+            return;
+        }
+        fillLineHighlight(graphics, entryLineNumbers[entryIndex], 0x50FFFF55);
+    }
+
+    /**
+     * Draws a light-red translucent highlight over every line whose command doesn't parse
+     * against Minecraft's own command tree (see {@link #computeInvalidLineNumbers}) - shown at
+     * all times, not just while a batch is running, since the whole point is to catch mistakes
+     * before pressing Run.
+     */
+    private void renderInvalidLineHighlights(GuiGraphicsExtractor graphics) {
+        for (int rawLine : invalidLineNumbers) {
+            fillLineHighlight(graphics, rawLine, 0x50FF5555);
         }
     }
 
-    private void renderSuggestions(GuiGraphicsExtractor graphics, int nextY) {
-        MutableComponent line = Component.empty();
-        int shown = Math.min(currentSuggestions.size(), MAX_SUGGESTIONS_SHOWN);
-        for (int i = 0; i < shown; i++) {
-            if (i > 0) {
-                line.append(Component.literal("  "));
-            }
-            ChatFormatting color = i == suggestionIndex ? ChatFormatting.YELLOW : ChatFormatting.GRAY;
-            line.append(Component.literal(currentSuggestions.get(i).getText()).withStyle(color));
-        }
-        if (currentSuggestions.size() > shown) {
-            line.append(Component.literal(" …").withStyle(ChatFormatting.DARK_GRAY));
-        }
-        line.append(Component.literal("  [Tab]").withStyle(ChatFormatting.DARK_GRAY));
+    /** Fills a translucent highlight rectangle over one raw editor line, scissored to the
+     * editor's own bounds so it can never bleed past it, and skipped entirely when that line
+     * isn't currently within the visible/scrolled viewport. */
+    private void fillLineHighlight(GuiGraphicsExtractor graphics, int rawLine, int color) {
+        int lineTop = rawLine * 9;
+        int innerPad = 4;
+        int highlightTop = commandBox.getY() + innerPad + (int) Math.round(lineTop - commandBox.scrollAmount());
+        int highlightBottom = highlightTop + 9;
 
-        int left = commandBox.getX();
-        int right = commandBox.getRight();
-        graphics.fill(left, nextY - 3, right, nextY + this.font.lineHeight + 3, 0xA0304050);
-        graphics.text(this.font, line, left + 4, nextY, 0xFFFFFFFF, true);
+        int boxTop = commandBox.getY();
+        int boxBottom = commandBox.getBottom();
+        if (highlightBottom <= boxTop || highlightTop >= boxBottom) {
+            return;
+        }
+
+        graphics.enableScissor(commandBox.getX(), boxTop, commandBox.getRight(), boxBottom);
+        graphics.fill(commandBox.getX() + 1, highlightTop, commandBox.getRight() - 1, highlightBottom, color);
+        graphics.disableScissor();
     }
 
     private int statusColor() {
         return switch (CommandBatchRunner.status()) {
             case RUNNING -> 0xFFFFFF55;
+            case PAUSED -> 0xFF55CCFF;
             case COMPLETED -> 0xFF55FF55;
             case STOPPED -> 0xFFFFAA55;
             case ERROR -> 0xFFFF5555;
@@ -390,7 +992,9 @@ public final class BatchCommandScreen extends Screen {
     @Override
     public void onClose() {
         savedText = commandBox.getValue();
-        savedDelay = delayBox.getValue();
+        BatchSettings settings = readSettingsFromUi();
+        applySettingsToUi(settings);
+        BatchConfig.save(settings);
         this.minecraft.setScreenAndShow(parent);
     }
 

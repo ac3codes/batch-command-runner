@@ -1,187 +1,187 @@
 package com.ac3codes.batchcommandrunner;
 
+import com.mojang.logging.LogUtils;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.chat.Component;
+import org.slf4j.Logger;
 
-import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Thin Minecraft-facing wrapper around a single {@link BatchRunnerState}: supplies the one
+ * genuinely game-dependent operation - actually sending a command, via the player's connection -
+ * plus the player/connection null-checks for defensive disconnect handling, and all logging.
+ * The dispatch/timing/pause/resume/stop state machine itself lives entirely in
+ * {@link BatchRunnerState}, which is dependency-free specifically so it can be unit tested
+ * without a live Minecraft client (see {@code BatchRunnerStateTest}).
+ *
+ * <p>All state here is static because exactly one batch can ever be running for the single
+ * client player, and the runner needs to keep ticking (via {@link #tick}) whether or not the
+ * {@code BatchCommandScreen} is currently open.
+ */
 public final class CommandBatchRunner {
-    public enum Status {
-        IDLE("Not active"),
-        RUNNING("Running"),
-        COMPLETED("Completed"),
-        STOPPED("Stopped"),
-        ERROR("Error");
-
-        private final String label;
-
-        Status(String label) {
-            this.label = label;
-        }
-
-        public String label() {
-            return label;
-        }
-    }
-
-    private static List<String> commands = List.of();
-    private static int nextIndex = -1;
-    private static int completedCount = 0;
-    private static int delayTicks = 1;
-    private static int ticksUntilNext = 0;
-    private static Status status = Status.IDLE;
-    private static String lastError = "";
+    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final BatchRunnerState state = new BatchRunnerState();
 
     private CommandBatchRunner() {
     }
 
-    public static List<String> parseCommands(String text) {
-        List<String> result = new ArrayList<>();
-        if (text == null || text.isBlank()) {
-            return result;
-        }
-
-        for (String rawLine : text.split("\\R", -1)) {
-            String line = rawLine.trim();
-            if (line.isEmpty() || line.startsWith("#")) {
-                continue;
-            }
-            while (line.startsWith("/")) {
-                line = line.substring(1).trim();
-            }
-            if (!line.isEmpty()) {
-                result.add(line);
+    public static void start(List<BatchEntry> entries, BatchSettings settings) {
+        state.start(entries, settings);
+        if (state.status() == BatchRunnerState.Status.RUNNING) {
+            LOGGER.info("[BatchCommandRunner] Starting batch: {} commands", state.totalCount());
+            if (settings.heavyCommandProtection()) {
+                LOGGER.info("[BatchCommandRunner] Heavy Command Protection enabled");
+                LOGGER.info("[BatchCommandRunner] Fill minimum={}, Clone minimum={}, Place minimum={}, Summon minimum={}",
+                        settings.fillMinimum(), settings.cloneMinimum(), settings.placeMinimum(), settings.summonMinimum());
             }
         }
-        return result;
     }
 
-    public static void start(List<String> newCommands, int newDelayTicks) {
-        commands = List.copyOf(newCommands);
-        delayTicks = Math.max(0, newDelayTicks);
-        completedCount = 0;
-        ticksUntilNext = 0;
-        lastError = "";
-
-        if (commands.isEmpty()) {
-            nextIndex = -1;
-            status = Status.IDLE;
-            return;
+    /** Pauses a running batch. The command that was about to send stays queued at the same
+     * remaining delay - resuming does not lose or rush that wait. */
+    public static void pause() {
+        if (state.pause()) {
+            LOGGER.info("[BatchCommandRunner] Batch paused at {}/{}", state.completedCount(), state.totalCount());
         }
+    }
 
-        nextIndex = 0;
-        status = Status.RUNNING;
+    public static void resume() {
+        if (state.resume()) {
+            LOGGER.info("[BatchCommandRunner] Batch resumed at {}/{}", state.completedCount(), state.totalCount());
+        }
     }
 
     public static void stop() {
-        if (status == Status.RUNNING) {
-            status = Status.STOPPED;
+        if (state.stop()) {
+            LOGGER.info("[BatchCommandRunner] Batch stopped at {}/{}", state.completedCount(), state.totalCount());
         }
-        nextIndex = -1;
-        ticksUntilNext = 0;
     }
 
     public static void reset() {
-        commands = List.of();
-        nextIndex = -1;
-        completedCount = 0;
-        ticksUntilNext = 0;
-        status = Status.IDLE;
-        lastError = "";
+        state.reset();
     }
 
     public static void tick(Minecraft client) {
-        if (status != Status.RUNNING) {
+        if (state.status() != BatchRunnerState.Status.RUNNING) {
             return;
         }
 
-        if (client.player == null || client.player.connection == null) {
-            status = Status.ERROR;
-            lastError = "No active player/server connection.";
-            nextIndex = -1;
+        LocalPlayer player = client.player;
+        if (player == null) {
+            state.fail("No active player.");
+            logFailure();
+            return;
+        }
+        ClientPacketListener connection = player.connection;
+        if (connection == null) {
+            state.fail("No active server connection.");
+            logFailure();
             return;
         }
 
-        if (nextIndex < 0 || nextIndex >= commands.size()) {
-            finish(client);
-            return;
+        int completedBefore = state.completedCount();
+        // ClientPacketListener#sendCommand expects the command WITHOUT a leading slash.
+        state.tick(connection::sendCommand);
+
+        if (state.completedCount() > completedBefore) {
+            BatchEntry sent = state.currentEntry();
+            LOGGER.debug("[BatchCommandRunner] Sent #{} ({}): {}", state.completedCount(), sent.type(), sent.command());
         }
 
-        if (ticksUntilNext > 0) {
-            ticksUntilNext--;
-            return;
-        }
-
-        String command = commands.get(nextIndex);
-        try {
-            // ClientPacketListener#sendCommand expects the command WITHOUT a leading slash.
-            client.player.connection.sendCommand(command);
-        } catch (Exception e) {
-            status = Status.ERROR;
-            lastError = e.getClass().getSimpleName() + ": " + String.valueOf(e.getMessage());
-            nextIndex = -1;
-            return;
-        }
-
-        completedCount++;
-        nextIndex++;
-
-        if (nextIndex >= commands.size()) {
-            finish(client);
-        } else {
-            // A value of 1 inserts one full client tick between command sends.
-            ticksUntilNext = delayTicks;
+        switch (state.status()) {
+            case COMPLETED -> {
+                LOGGER.info("[BatchCommandRunner] Batch complete: {} commands", state.totalCount());
+                notifyCompletion(player);
+            }
+            case ERROR -> logFailure();
+            default -> {
+            }
         }
     }
 
-    private static void finish(Minecraft client) {
-        status = Status.COMPLETED;
-        nextIndex = -1;
-        ticksUntilNext = 0;
+    private static void logFailure() {
+        LOGGER.warn("[BatchCommandRunner] Batch stopped with error at {}/{}: {}",
+                state.completedCount(), state.totalCount(), state.lastError());
+    }
 
-        if (client.player != null) {
-            client.player.sendSystemMessage(
-                    Component.literal("BCR --> You: List of Commands Completed")
-                            .withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC)
-            );
-        }
+    private static void notifyCompletion(LocalPlayer player) {
+        player.sendSystemMessage(
+                Component.literal("BCR --> You: List of Commands Completed")
+                        .withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC)
+        );
     }
 
     public static boolean isRunning() {
-        return status == Status.RUNNING;
+        return state.isRunning();
     }
 
-    public static Status status() {
-        return status;
+    public static boolean isActive() {
+        return state.isActive();
+    }
+
+    public static BatchRunnerState.Status status() {
+        return state.status();
     }
 
     public static int totalCount() {
-        return commands.size();
+        return state.totalCount();
     }
 
     public static int completedCount() {
-        return completedCount;
+        return state.completedCount();
     }
 
-    public static int nextCommandNumber() {
-        return nextIndex >= 0 ? nextIndex + 1 : -1;
+    /** The entry most recently sent to the server, kept for logging/debugging only - UI code
+     * should use {@link #nextEntry()} instead. Null before the first command of a batch has
+     * been sent. */
+    public static BatchEntry currentEntry() {
+        return state.currentEntry();
     }
 
-    public static String nextCommand() {
-        return nextIndex >= 0 && nextIndex < commands.size() ? commands.get(nextIndex) : null;
+    /** The index of the entry most recently sent, or -1 before anything has been sent. Kept for
+     * logging/debugging only - see {@link #nextEntryIndex()} for the UI-facing equivalent. */
+    public static int currentEntryIndex() {
+        return state.currentEntryIndex();
     }
 
-    public static int delayTicks() {
-        return delayTicks;
+    /** The entry that will be sent next, once its delay elapses - what the UI should highlight
+     * and display. Equal to entry #1 right after a batch starts, before anything has actually
+     * been dispatched yet, and null once there's nothing left to send. */
+    public static BatchEntry nextEntry() {
+        return state.nextEntry();
+    }
+
+    /** The index of the entry that will be sent next, or -1 if there is none. */
+    public static int nextEntryIndex() {
+        return state.nextEntryIndex();
+    }
+
+    /** Whether the most recently sent command's delay was raised above the plain normal delay
+     * by Heavy Command Protection. */
+    public static boolean isCurrentCommandProtected() {
+        return state.isCurrentCommandProtected();
+    }
+
+    /** The resolved effective delay (ticks) that was applied after the most recently
+     * dispatched command - fixed for that command, unlike {@link #ticksUntilNext()} which
+     * counts down from it. */
+    public static int currentCommandDelay() {
+        return state.currentCommandDelay();
+    }
+
+    public static BatchSettings settings() {
+        return state.settings();
     }
 
     public static int ticksUntilNext() {
-        return ticksUntilNext;
+        return state.ticksUntilNext();
     }
 
     public static String lastError() {
-        return lastError;
+        return state.lastError();
     }
 }
