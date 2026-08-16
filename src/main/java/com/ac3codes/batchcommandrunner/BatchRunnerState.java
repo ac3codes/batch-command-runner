@@ -107,6 +107,27 @@ public final class BatchRunnerState {
         return wasActive;
     }
 
+    /** Immediately terminates an active (running or paused) batch: discards its queue, zeroes
+     * completedCount, and clears any pending dispatch (which is what makes the executed-command
+     * highlight disappear, since that's driven by {@link #nextEntryIndex()}/{@link #isActive()}).
+     * Unlike {@link #stop}, which halts in place but leaves {@link #completedCount()}/entries
+     * intact for display, this always zeroes them. Transitions to {@link Status#STOPPED} - not
+     * {@link Status#IDLE} via {@link #reset} - so status/log output can still tell "explicitly
+     * stopped" apart from "never started", even though the UI shows the same single Run Commands
+     * control for both. Never resumable afterward - only a fresh {@link #start} can run again. */
+    public void hardStop() {
+        if (status == Status.RUNNING || status == Status.PAUSED) {
+            status = Status.STOPPED;
+        }
+        entries = List.of();
+        nextIndex = -1;
+        completedCount = 0;
+        ticksUntilNext = 0;
+        lastDispatchedIndex = -1;
+        lastDispatchWasProtected = false;
+        lastDispatchedEffectiveDelay = 0;
+    }
+
     public void reset() {
         entries = List.of();
         nextIndex = -1;

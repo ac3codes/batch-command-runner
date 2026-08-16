@@ -35,6 +35,9 @@ public final class BatchCommandScreen extends Screen {
     private static final String[] MINIMUM_LABELS = {"Fill:", "Clone:", "Place:", "Summon:"};
     private static final int MINIMUM_BOX_WIDTH = 34;
     private static final int MINIMUM_GROUP_GAP = 14;
+    // Matches commandBox.setLineLimit(20_000) below (5 digits covers up to 99,999) - fixed so the
+    // gutter's width never shifts as a batch grows toward that limit.
+    private static final int LINE_NUMBER_GUTTER_DIGITS = 5;
 
     private static String savedText = "";
     private static BatchSettings savedSettings = BatchConfig.load();
@@ -62,6 +65,9 @@ public final class BatchCommandScreen extends Screen {
     private Button runButton;
     private Button stopButton;
     private Button clearButton;
+    // Left margin computed in init(), reused by renderLineNumbers() as the left edge of its
+    // gutter column (which otherwise draws relative only to commandBox's own X position).
+    private int editorMargin;
 
     // Count of executable lines that would actually be queued if Run were pressed right now
     // (blank/comment/empty-after-slash lines excluded, same as CommandUtils.parseEntries), split
@@ -110,13 +116,19 @@ public final class BatchCommandScreen extends Screen {
     @Override
     protected void init() {
         int margin = Math.max(16, this.width / 16);
+        this.editorMargin = margin;
         int top = 38;
         int footerHeight = 158;
-        int editorWidth = Math.max(220, this.width - margin * 2);
+        // Reserves a gutter to the left of the editor for line numbers (see renderLineNumbers),
+        // sized for up to LINE_NUMBER_GUTTER_DIGITS digits so it never has to resize as the
+        // batch grows toward the editor's own line limit.
+        int lineNumberGutterWidth = this.font.width("0".repeat(LINE_NUMBER_GUTTER_DIGITS)) + 10;
+        int editorX = margin + lineNumberGutterWidth;
+        int editorWidth = Math.max(220, this.width - margin * 2 - lineNumberGutterWidth);
         int editorHeight = Math.max(90, this.height - top - footerHeight);
 
         commandBox = MultiLineEditBox.builder()
-                .setX(margin)
+                .setX(editorX)
                 .setY(top)
                 .setPlaceholder(Component.literal("Paste commands here — one command per line"))
                 .setShowBackground(true)
@@ -130,13 +142,12 @@ public final class BatchCommandScreen extends Screen {
             // Deferred to the next tick rather than recomputed here - see commandCountsDirty's
             // doc for why.
             commandCountsDirty = true;
-            // Editing the command list while paused is the only way to fully terminate a batch
-            // now that Stop/Resume are one button - there is no going back to Resume afterward.
+            // The editor is only ever editable while paused (see updateWidgetStates) - editing at
+            // that point is how a paused batch gets fully terminated: not just halted in place,
+            // but reset back to zero and no longer resumable, since the text underneath it may no
+            // longer match what was queued.
             if (CommandBatchRunner.status() == BatchRunnerState.Status.PAUSED) {
-                CommandBatchRunner.stop();
-            }
-            if (!CommandBatchRunner.isActive() && CommandBatchRunner.status() != BatchRunnerState.Status.IDLE) {
-                CommandBatchRunner.reset();
+                CommandBatchRunner.hardStop();
             }
         });
         // A one-time synchronous seed for the initial text, since the listener above wasn't
@@ -149,7 +160,7 @@ public final class BatchCommandScreen extends Screen {
         int settingsY = top + editorHeight + this.font.lineHeight + 9;
         int minimumsY = settingsY + 22;
 
-        delayBox = new EditBox(this.font, margin + 48, settingsY - 5, 50, 18, Component.literal("Delay ticks"));
+        delayBox = new EditBox(this.font, editorX + 48, settingsY - 5, 50, 18, Component.literal("Delay ticks"));
         delayBox.setValue(savedDelayText);
         delayBox.setResponder(value -> {
             if (value.isEmpty() || value.matches("\\d{0,4}")) {
@@ -164,7 +175,7 @@ public final class BatchCommandScreen extends Screen {
         // and everything placed after it in this row (the expand arrow, slash-priority toggle)
         // has a stable anchor.
         int heavyButtonWidth = this.font.width("Heavy Protection: OFF") + 16;
-        int heavyButtonX = margin + 48 + 50 + 20;
+        int heavyButtonX = editorX + 48 + 50 + 20;
         heavyProtectionButton = Button.builder(heavyProtectionLabel(), btn -> toggleHeavyProtection())
                 .bounds(heavyButtonX, settingsY - 5, heavyButtonWidth, 18)
                 .build();
@@ -185,7 +196,7 @@ public final class BatchCommandScreen extends Screen {
                 .build();
         this.addRenderableWidget(slashPriorityButton);
 
-        int[] minimumLabelX = minimumLabelX(margin);
+        int[] minimumLabelX = minimumLabelX(editorX);
         fillMinimumBox = new EditBox(this.font, minimumLabelX[0] + this.font.width(MINIMUM_LABELS[0]) + 4, minimumsY - 5, MINIMUM_BOX_WIDTH, 18, Component.literal("Fill minimum ticks"));
         cloneMinimumBox = new EditBox(this.font, minimumLabelX[1] + this.font.width(MINIMUM_LABELS[1]) + 4, minimumsY - 5, MINIMUM_BOX_WIDTH, 18, Component.literal("Clone minimum ticks"));
         placeMinimumBox = new EditBox(this.font, minimumLabelX[2] + this.font.width(MINIMUM_LABELS[2]) + 4, minimumsY - 5, MINIMUM_BOX_WIDTH, 18, Component.literal("Place minimum ticks"));
@@ -215,14 +226,16 @@ public final class BatchCommandScreen extends Screen {
         clearButton = Button.builder(Component.literal("Clear"), btn -> clearEditor())
                 .bounds(buttonX, buttonY, buttonWidth, 20)
                 .build();
-        // Stop/Resume is a single button: pressing it while running pauses the batch (and the
-        // label switches to "Resume"); pressing it again resumes. There is no separate hard-stop
-        // action anymore - editing the command list while paused is what fully terminates the
-        // batch (see the commandBox value listener), matching the requested Stop/Resume model.
-        stopButton = Button.builder(Component.literal("Stop"), btn -> onStopResumePressed())
+        // Pause/Resume is a single button: pressing it while running pauses the batch (and the
+        // label switches to "Resume"); pressing it again resumes. It never discards progress -
+        // see runButton below for the separate hard-stop action.
+        stopButton = Button.builder(Component.literal("Pause"), btn -> onStopResumePressed())
                 .bounds(buttonX + (buttonWidth + gap), buttonY, buttonWidth, 20)
                 .build();
-        runButton = Button.builder(Component.literal("Run Commands"), btn -> runCommands())
+        // Doubles as the hard-stop control: while a batch is running or paused its label becomes
+        // "Stop" and pressing it fully resets progress back to zero (not resumable, unlike the
+        // Pause/Resume button) - see onRunOrStopPressed.
+        runButton = Button.builder(Component.literal("Run Commands"), btn -> onRunOrStopPressed())
                 .bounds(buttonX + (buttonWidth + gap) * 2, buttonY, buttonWidth, 20)
                 .build();
 
@@ -493,14 +506,13 @@ public final class BatchCommandScreen extends Screen {
         }
         BatchRunnerState.Status status = CommandBatchRunner.status();
         boolean active = CommandBatchRunner.isActive();
+        boolean running = status == BatchRunnerState.Status.RUNNING;
         boolean paused = status == BatchRunnerState.Status.PAUSED;
 
-        // Locked for the entire time a batch is active (RUNNING or PAUSED): the queued batch is
-        // already snapshotted and entryLineNumbers was computed against the text as it stood at
-        // Run time, so editing during PAUSED would desync the two. Editing while paused is still
-        // how a batch gets fully terminated (see the value listener) - it just has to happen
-        // after Stop/Resume brings the batch back to inactive first.
-        commandBox.active = !active;
+        // Only locked while actually RUNNING. While PAUSED, the editor stays scrollable and
+        // editable - the queued batch is frozen either way, and any actual edit terminates it
+        // (see the value listener) rather than risking a desync with the in-flight run.
+        commandBox.active = !running;
         delayBox.active = !active;
         fillMinimumBox.active = !active;
         fillMinimumBox.visible = minimumsExpanded;
@@ -519,19 +531,35 @@ public final class BatchCommandScreen extends Screen {
         slashPriorityButton.visible = BatchCommandRunnerClient.isSlashConflict();
         slashPriorityButton.active = !active;
         clearButton.active = !active;
-        runButton.active = !active && validCommandCount > 0;
+        // RUNNING/PAUSED: [Pause or Resume] [Stop]. Every other state: [Run Commands] alone -
+        // stopButton is fully hidden (not just disabled) rather than left visible-but-grayed-out,
+        // since there is no resumable batch for it to act on at all in that case.
+        runButton.setMessage(Component.literal(active ? "Stop" : "Run Commands"));
+        runButton.active = active || validCommandCount > 0;
+        stopButton.visible = active;
         stopButton.active = active;
-        stopButton.setMessage(Component.literal(paused ? "Resume" : "Stop"));
+        stopButton.setMessage(Component.literal(paused ? "Resume" : "Pause"));
     }
 
-    /** The single Stop/Resume button: pauses a running batch, or resumes a paused one. There is
-     * no separate hard-stop anymore - see the commandBox value listener for how a batch is now
-     * fully terminated (editing the list while paused). */
+    /** The Pause/Resume button: pauses a running batch, or resumes a paused one, without ever
+     * discarding progress. See {@link #onRunOrStopPressed} for the separate hard-stop control. */
     private void onStopResumePressed() {
         if (CommandBatchRunner.status() == BatchRunnerState.Status.PAUSED) {
             CommandBatchRunner.resume();
         } else {
             CommandBatchRunner.pause();
+        }
+    }
+
+    /** The Run Commands / Stop button: starts a new batch while idle, or - while one is running
+     * or paused - fully resets it back to zero instead. Unlike Pause, this is never resumable
+     * afterward: the text stays exactly as typed, ready to edit and run again from the start. */
+    private void onRunOrStopPressed() {
+        if (CommandBatchRunner.isActive()) {
+            CommandBatchRunner.hardStop();
+            updateWidgetStates();
+        } else {
+            runCommands();
         }
     }
 
@@ -565,14 +593,23 @@ public final class BatchCommandScreen extends Screen {
         if (entryIndex < 0 || entryIndex >= entryLineNumbers.length) {
             return;
         }
-        int lineTop = entryLineNumbers[entryIndex] * 9;
+        int rowHeight = rowHeight();
+        int lineTop = entryLineNumbers[entryIndex] * rowHeight;
         double scrollAmount = commandBox.scrollAmount();
         int viewportHeight = commandBox.getHeight();
         if (lineTop < scrollAmount) {
             commandBox.setScrollAmount(lineTop);
-        } else if (lineTop + 9 > scrollAmount + viewportHeight) {
-            commandBox.setScrollAmount(lineTop + 9 - viewportHeight);
+        } else if (lineTop + rowHeight > scrollAmount + viewportHeight) {
+            commandBox.setScrollAmount(lineTop + rowHeight - viewportHeight);
         }
+    }
+
+    /** The vertical distance between successive raw text rows in commandBox, matching the pitch
+     * {@link #cursorScreenPos} already uses for the same editor - kept as one shared method so
+     * the highlight/scroll/gutter/popup positioning below can never drift out of sync with each
+     * other the way the highlight's own hardcoded row height once drifted from this. */
+    private int rowHeight() {
+        return this.font.lineHeight + 1;
     }
 
     @Override
@@ -667,6 +704,22 @@ public final class BatchCommandScreen extends Screen {
             return;
         }
 
+        try {
+            updateSuggestionsFor(value, cursor);
+        } catch (RuntimeException e) {
+            // Brigadier's suggestion machinery is fragile against a command line that keeps
+            // changing shape faster than a request/response round-trip (e.g. Cmd+A then holding
+            // Delete across many lines at once) - a stale cursor/parse combination here has
+            // previously thrown (IllegalStateException from findSuggestionContext,
+            // StringIndexOutOfBoundsException from a since-shrunk line) and, because exceptions
+            // escaping Screen#tick are fatal, crashed the whole client. Losing the popup for one
+            // keystroke is a fine trade for never taking the game down with it.
+            LOGGER.warn("[BatchCommandRunner] Failed to refresh autocomplete suggestions.", e);
+            invalidateSuggestions();
+        }
+    }
+
+    private void updateSuggestionsFor(String value, int cursor) {
         AutocompleteUtil.LineContext context = AutocompleteUtil.extractCurrentLine(value, cursor);
         currentLineContext = context;
 
@@ -723,8 +776,7 @@ public final class BatchCommandScreen extends Screen {
     private int[] suggestionAnchor(AutocompleteUtil.LineContext context, String value) {
         int[] cursorPos = cursorScreenPos(context, value);
         if (cursorPos != null) {
-            int lineHeight = this.font.lineHeight + 1;
-            return new int[]{cursorPos[0], cursorPos[1] + lineHeight};
+            return new int[]{cursorPos[0], cursorPos[1] + rowHeight()};
         }
         return new int[]{commandBox.getX() + 4, commandBox.getBottom() + 4};
     }
@@ -743,7 +795,7 @@ public final class BatchCommandScreen extends Screen {
             }
         }
 
-        int lineHeight = this.font.lineHeight + 1;
+        int lineHeight = rowHeight();
         int innerPad = 4;
         double scrollAmount = commandBox.scrollAmount();
         int firstVisibleLine = (int) (scrollAmount / lineHeight);
@@ -843,6 +895,7 @@ public final class BatchCommandScreen extends Screen {
         renderInvalidLineHighlights(graphics);
         renderCurrentLineHighlight(graphics);
         renderGhostHint(graphics);
+        renderLineNumbers(graphics);
 
         graphics.centeredText(this.font, this.title, this.width / 2, 14, 0xFFFFFFFF);
 
@@ -967,14 +1020,59 @@ public final class BatchCommandScreen extends Screen {
         }
     }
 
+    /**
+     * Draws IDE-style line numbers (1-based, one per raw {@code \n}-delimited line - blank and
+     * comment lines included, same as any code editor's gutter) in the margin reserved for them
+     * to the left of commandBox (see {@link #lineNumberGutterWidth} in init()). Scrolls in lock
+     * step with the editor since it shares the same scrollAmount and {@link #rowHeight()} the
+     * highlight/scroll logic above uses, and is scissored to its own column so a very long batch
+     * never draws numbers over the editor itself.
+     */
+    private void renderLineNumbers(GuiGraphicsExtractor graphics) {
+        String value = commandBox.getValue();
+        int rowHeight = rowHeight();
+        int innerPad = 4;
+        double scrollAmount = commandBox.scrollAmount();
+        int boxTop = commandBox.getY();
+        int boxBottom = commandBox.getBottom();
+        int gutterLeft = editorMargin;
+        int gutterRight = commandBox.getX() - 6;
+
+        graphics.enableScissor(gutterLeft, boxTop, commandBox.getX() - 2, boxBottom);
+        int lineIndex = 0;
+        int lineStart = 0;
+        int length = value.length();
+        while (true) {
+            int lineTop = boxTop + innerPad + (int) Math.round(lineIndex * rowHeight - scrollAmount);
+            if (lineTop >= boxBottom) {
+                break;
+            }
+            if (lineTop + rowHeight > boxTop) {
+                String label = String.valueOf(lineIndex + 1);
+                graphics.text(this.font, label, gutterRight - this.font.width(label), lineTop, 0xFF888888, false);
+            }
+            int newline = value.indexOf('\n', lineStart);
+            if (newline < 0) {
+                break;
+            }
+            lineStart = newline + 1;
+            lineIndex++;
+            if (lineStart > length) {
+                break;
+            }
+        }
+        graphics.disableScissor();
+    }
+
     /** Fills a translucent highlight rectangle over one raw editor line, scissored to the
      * editor's own bounds so it can never bleed past it, and skipped entirely when that line
      * isn't currently within the visible/scrolled viewport. */
     private void fillLineHighlight(GuiGraphicsExtractor graphics, int rawLine, int color) {
-        int lineTop = rawLine * 9;
+        int rowHeight = rowHeight();
+        int lineTop = rawLine * rowHeight;
         int innerPad = 4;
         int highlightTop = commandBox.getY() + innerPad + (int) Math.round(lineTop - commandBox.scrollAmount());
-        int highlightBottom = highlightTop + 9;
+        int highlightBottom = highlightTop + rowHeight;
 
         int boxTop = commandBox.getY();
         int boxBottom = commandBox.getBottom();

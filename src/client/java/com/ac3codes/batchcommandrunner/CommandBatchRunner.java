@@ -61,6 +61,15 @@ public final class CommandBatchRunner {
         }
     }
 
+    /** Fully terminates and resets an active batch (running or paused) back to zero - not
+     * resumable afterward, only re-runnable from scratch. See {@link BatchRunnerState#hardStop}. */
+    public static void hardStop() {
+        if (state.isActive()) {
+            LOGGER.info("[BatchCommandRunner] Batch stopped and reset at {}/{}", state.completedCount(), state.totalCount());
+        }
+        state.hardStop();
+    }
+
     public static void reset() {
         state.reset();
     }
@@ -109,8 +118,9 @@ public final class CommandBatchRunner {
     }
 
     private static void notifyCompletion(LocalPlayer player) {
+        String playerName = player.getGameProfile().name();
         player.sendSystemMessage(
-                Component.literal("BCR --> You: List of Commands Completed")
+                Component.literal("batch --> " + playerName + ": Commands Complete")
                         .withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC)
         );
     }

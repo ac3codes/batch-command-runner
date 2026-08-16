@@ -4,7 +4,6 @@ import com.mojang.blaze3d.platform.InputConstants;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
-import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.minecraft.client.KeyMapping;
@@ -47,17 +46,14 @@ public final class BatchCommandRunnerClient implements ClientModInitializer {
                 category
         ));
 
-        ClientCommandRegistrationCallback.EVENT.register((dispatcher, buildContext) -> {
-            dispatcher.register(ClientCommands.literal("batch")
-                    .requires(FabricClientCommandSource::attended)
-                    .executes(context -> {
-                        Minecraft client = context.getSource().getClient();
-                        if (client.player != null) {
-                            client.setScreenAndShow(new BatchCommandScreen(client.gui.screen()));
-                        }
-                        return 1;
-                    }));
-        });
+        // No .requires() gate here - this is a manually-typed chat command with no reason to
+        // ever refuse a normal player, unlike commands that guard against automation.
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, buildContext) ->
+                dispatcher.register(ClientCommands.literal("batch")
+                        .executes(context -> {
+                            openScreen(context.getSource().getClient());
+                            return 1;
+                        })));
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             CommandBatchRunner.tick(client);
@@ -68,10 +64,18 @@ public final class BatchCommandRunnerClient implements ClientModInitializer {
             // vanilla's own key keeps working completely independently and normally on its own
             // binding - there's nothing left to suppress or restore.
             while (openKey.consumeClick()) {
-                if (client.player != null && (!isSlashConflict() || batchSlashPriority)) {
-                    client.setScreenAndShow(new BatchCommandScreen(client.gui.screen()));
+                if (!isSlashConflict() || batchSlashPriority) {
+                    openScreen(client);
                 }
             }
         });
+    }
+
+    /** Opens the batch UI, shared by both the "/" keybind and the {@code /batch} command so the
+     * two can never behave differently from one another. */
+    private static void openScreen(Minecraft client) {
+        if (client.player != null) {
+            client.setScreenAndShow(new BatchCommandScreen(client.gui.screen()));
+        }
     }
 }
