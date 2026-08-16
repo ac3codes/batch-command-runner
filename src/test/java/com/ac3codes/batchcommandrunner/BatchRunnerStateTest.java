@@ -353,6 +353,51 @@ class BatchRunnerStateTest {
         assertFalse(state.isCurrentCommandProtected(), "delay came from normalDelay, not protection");
     }
 
+    // ---- next/completed progress numbering (UI's "Next #i / n" and "Completed: i / n") --------
+
+    @Test
+    void nextAndCompletedProgressionMatchesExecutableIndexNotDispatchCount() {
+        // Mirrors the "all valid" worked example: three normal commands, checking the exact
+        // (nextEntryIndex()+1, totalCount()) and (completedCount(), totalCount()) pairs the UI
+        // renders as "Next #i / n" and "Completed: i / n" at each step.
+        BatchSettings settings = new BatchSettings(0, false, 10, 10, 20, 2);
+        BatchRunnerState state = new BatchRunnerState();
+        state.start(List.of(normal("say one"), normal("say two"), normal("say three")), settings);
+
+        assertEquals(0, state.completedCount());
+        assertEquals(1, state.nextEntryIndex() + 1, "before execution, command #1 is next");
+        assertEquals(3, state.totalCount());
+
+        RecordingSender sender = new RecordingSender();
+        state.tick(sender); // dispatches "say one"
+        assertEquals(1, state.completedCount());
+        assertEquals(2, state.nextEntryIndex() + 1);
+
+        state.tick(sender); // dispatches "say two"
+        assertEquals(2, state.completedCount());
+        assertEquals(3, state.nextEntryIndex() + 1);
+
+        state.tick(sender); // dispatches "say three" - batch completes
+        assertEquals(3, state.completedCount());
+        assertEquals(BatchRunnerState.Status.COMPLETED, state.status());
+        assertNull(state.nextEntry(), "no pending entry once completed - UI shows \"Next: none\"");
+    }
+
+    @Test
+    void nextEntryIsNullAfterStopMidBatch() {
+        BatchSettings settings = new BatchSettings(5, false, 10, 10, 20, 2);
+        BatchRunnerState state = new BatchRunnerState();
+        state.start(List.of(normal("say a"), normal("say b"), normal("say c")), settings);
+
+        RecordingSender sender = new RecordingSender();
+        state.tick(sender); // dispatches "say a"
+        state.stop();
+
+        assertNull(state.nextEntry(), "stopping mid-batch must clear the pending entry - UI shows \"Next: none\"");
+        assertEquals(-1, state.nextEntryIndex());
+        assertEquals(1, state.completedCount());
+    }
+
     @Test
     void resetReturnsToIdleAndClearsProgress() {
         BatchRunnerState state = new BatchRunnerState();

@@ -173,6 +173,20 @@ class CommandUtilsTest {
         assertEquals(0, CommandUtils.countCommands("\n\n\n"));
     }
 
+    @Test
+    void aLoneSlashLineIsNotBlankOrCommentButParseEntriesStillExcludesIt() {
+        // A line that's non-blank and doesn't start with '#' (so countCommands counts it) but
+        // strips down to nothing once the leading slash is removed - parseEntries must still
+        // drop it, since it isn't a command that could ever be queued or sent. The batch editor
+        // deliberately counts its live "Commands: N" summary off parseEntries().size() rather
+        // than countCommands() specifically so this line can never be counted as executable when
+        // it wouldn't actually be queued by Run.
+        String text = "/say a\n/\n/say b";
+        assertFalse(CommandUtils.isBlankOrComment("/"));
+        assertEquals(2, CommandUtils.parseEntries(text).size());
+        assertEquals(3, CommandUtils.countCommands(text), "countCommands has no notion of empty-after-slash");
+    }
+
     // ---- volume estimation: fill -------------------------------------------------------------
 
     @Test

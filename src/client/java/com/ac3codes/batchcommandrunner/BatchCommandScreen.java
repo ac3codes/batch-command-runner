@@ -63,7 +63,16 @@ public final class BatchCommandScreen extends Screen {
     private Button stopButton;
     private Button clearButton;
 
-    private int parsedCommandCount;
+    // Count of executable lines that would actually be queued if Run were pressed right now
+    // (blank/comment/empty-after-slash lines excluded, same as CommandUtils.parseEntries), split
+    // between what parses/executes and what doesn't - see refreshCommandCounts().
+    private int validCommandCount;
+    private int invalidCommandCount;
+    // Set by the editor's value listener on every edit; the actual recompute (parseEntries +
+    // Brigadier validation over every line) happens at most once per client tick rather than
+    // once per keystroke, so pasting into or auto-repeat-deleting a large batch can't spike
+    // per-frame cost - see tick().
+    private boolean commandCountsDirty;
     // Maps a started batch's entry index to the raw (\n-delimited) line number it came from in
     // the editor text, since blank/comment lines are skipped when building entries and so don't
     // line up 1:1 with them. Computed once when Run is pressed; used to highlight/scroll to the
@@ -118,12 +127,9 @@ public final class BatchCommandScreen extends Screen {
         commandBox.setValue(savedText, true);
         commandBox.setValueListener(value -> {
             savedText = value;
-            parsedCommandCount = CommandUtils.countCommands(value);
-            // Red highlights are deliberately NOT recomputed live here - they only reflect the
-            // state as of the last Enter press or Run press (see keyPressed/runCommands), and
-            // editing a line makes its old red highlight vanish immediately rather than staying
-            // stale until the next check.
-            invalidLineNumbers = Set.of();
+            // Deferred to the next tick rather than recomputed here - see commandCountsDirty's
+            // doc for why.
+            commandCountsDirty = true;
             // Editing the command list while paused is the only way to fully terminate a batch
             // now that Stop/Resume are one button - there is no going back to Resume afterward.
             if (CommandBatchRunner.status() == BatchRunnerState.Status.PAUSED) {
@@ -133,7 +139,9 @@ public final class BatchCommandScreen extends Screen {
                 CommandBatchRunner.reset();
             }
         });
-        parsedCommandCount = CommandUtils.countCommands(savedText);
+        // A one-time synchronous seed for the initial text, since the listener above wasn't
+        // attached yet when setValue() ran a few lines up and so never fired for it.
+        refreshCommandCounts(savedText);
         this.addRenderableWidget(commandBox);
         this.editModel = extractTextField(commandBox);
         hideSuggestions();
@@ -153,7 +161,8 @@ public final class BatchCommandScreen extends Screen {
         this.addRenderableWidget(delayBox);
 
         // Sized from the longer of "ON"/"OFF" so the button never changes width when toggled,
-        // and everything placed after it (the expand arrow, "Commands: N") has a stable anchor.
+        // and everything placed after it in this row (the expand arrow, slash-priority toggle)
+        // has a stable anchor.
         int heavyButtonWidth = this.font.width("Heavy Protection: OFF") + 16;
         int heavyButtonX = margin + 48 + 50 + 20;
         heavyProtectionButton = Button.builder(heavyProtectionLabel(), btn -> toggleHeavyProtection())
@@ -266,11 +275,26 @@ public final class BatchCommandScreen extends Screen {
         }
     }
 
+    /**
+     * Recomputes {@link #invalidLineNumbers} and the valid/invalid executable-command counts
+     * from scratch, reusing the exact same parser ({@link CommandUtils#parseEntries}) and
+     * Brigadier validation ({@link #computeInvalidLineNumbers}) that {@link #runCommands()}
+     * itself relies on - so "Commands: N valid | M invalid" always matches exactly what pressing
+     * Run would queue, rather than being computed by a separate counting pass that could drift
+     * from it.
+     */
+    private void refreshCommandCounts(String text) {
+        invalidLineNumbers = computeInvalidLineNumbers(text);
+        int total = CommandUtils.parseEntries(text).size();
+        invalidCommandCount = invalidLineNumbers.size();
+        validCommandCount = total - invalidCommandCount;
+    }
+
     private void runCommands() {
         String text = commandBox.getValue();
-        // Recomputed fresh rather than trusting the live-updated field, so a stale value can
-        // never sneak an invalid command into the batch.
-        invalidLineNumbers = computeInvalidLineNumbers(text);
+        // Recomputed fresh rather than trusting the live (tick-deferred) counts, so a stale
+        // value can never sneak an invalid command into the batch.
+        refreshCommandCounts(text);
 
         List<BatchEntry> allEntries = CommandUtils.parseEntries(text);
         int[] allLineNumbers = computeEntryLineNumbers(text);
@@ -458,8 +482,7 @@ public final class BatchCommandScreen extends Screen {
         }
         savedText = "";
         commandBox.setValue("");
-        parsedCommandCount = 0;
-        invalidLineNumbers = Set.of();
+        refreshCommandCounts("");
         CommandBatchRunner.reset();
         hideSuggestions();
     }
@@ -496,7 +519,7 @@ public final class BatchCommandScreen extends Screen {
         slashPriorityButton.visible = BatchCommandRunnerClient.isSlashConflict();
         slashPriorityButton.active = !active;
         clearButton.active = !active;
-        runButton.active = !active && parsedCommandCount > 0;
+        runButton.active = !active && validCommandCount > 0;
         stopButton.active = active;
         stopButton.setMessage(Component.literal(paused ? "Resume" : "Stop"));
     }
@@ -515,6 +538,10 @@ public final class BatchCommandScreen extends Screen {
     @Override
     public void tick() {
         super.tick();
+        if (commandCountsDirty) {
+            refreshCommandCounts(commandBox.getValue());
+            commandCountsDirty = false;
+        }
         updateWidgetStates();
         refreshSuggestionsIfNeeded();
         scrollToCurrentLineIfNeeded();
@@ -581,14 +608,7 @@ public final class BatchCommandScreen extends Screen {
             return true;
         }
 
-        boolean handled = super.keyPressed(event);
-        // A plain Enter (no Ctrl) just inserted a newline into the editor above - re-check red
-        // highlights now that a line has been "committed", per the same on-Enter-or-Run trigger
-        // Run itself already uses (see runCommands).
-        if (isEnter && commandBox.isFocused()) {
-            invalidLineNumbers = computeInvalidLineNumbers(commandBox.getValue());
-        }
-        return handled;
+        return super.keyPressed(event);
     }
 
     @Override
@@ -826,13 +846,6 @@ public final class BatchCommandScreen extends Screen {
 
         graphics.centeredText(this.font, this.title, this.width / 2, 14, 0xFFFFFFFF);
 
-        // Kept on the title row, right-aligned to the editor's own right edge, deliberately
-        // separate from the settings-button row below - that row is already crowded (Delay,
-        // Heavy Protection, expand arrow, slash-priority toggle) and any width-based clamping
-        // there has repeatedly ended up overlapping one of those buttons in practice.
-        String commandsText = "Commands: " + parsedCommandCount;
-        graphics.text(this.font, commandsText, commandBox.getRight() - this.font.width(commandsText), 14, 0xFFFFFFFF, true);
-
         int editorBottom = commandBox.getBottom();
         int settingsY = editorBottom + this.font.lineHeight + 9;
         int minimumsY = settingsY + 22;
@@ -856,45 +869,44 @@ public final class BatchCommandScreen extends Screen {
         BatchRunnerState.Status status = CommandBatchRunner.status();
         boolean active = status == BatchRunnerState.Status.RUNNING || status == BatchRunnerState.Status.PAUSED;
 
-        // Status, progress, and the countdown all share one line, spread across the full width
-        // (left/right) rather than stacked as separate narrow lines - the Heavy Protection
-        // on/off state is deliberately not repeated here since the toggle button above already
-        // shows it.
+        // Status / Commands / Completed / Next are one visually grouped block, always rendered
+        // as the same four rows in the same order regardless of state - only the text and color
+        // of each row changes - so the layout never jumps as the batch moves between states.
         String statusText = "Status: " + status.label();
-        if (active) {
-            statusText += "  (" + CommandBatchRunner.completedCount() + " / " + CommandBatchRunner.totalCount() + ")";
+        if (status == BatchRunnerState.Status.ERROR && !CommandBatchRunner.lastError().isEmpty()) {
+            statusText += " - " + CommandBatchRunner.lastError();
         }
-        graphics.text(this.font, statusText, left, lineY, statusColor(), true);
-
+        graphics.text(this.font, trimToWidth(statusText, right - left), left, lineY, statusColor(), true);
         if (active) {
             String nextIn = "Next command in: " + CommandBatchRunner.ticksUntilNext() + " ticks";
             graphics.text(this.font, nextIn, right - this.font.width(nextIn), lineY, 0xFFBBBBBB, false);
         }
         lineY += 12;
 
-        int errorCount = invalidLineNumbers.size();
-        String errorsText = "Errors: " + errorCount;
-        graphics.text(this.font, errorsText, left, lineY, errorCount > 0 ? 0xFFFF5555 : 0xFFBBBBBB, true);
+        String commandsText = invalidCommandCount > 0
+                ? "Commands: " + validCommandCount + " valid | " + invalidCommandCount + " invalid"
+                : "Commands: " + validCommandCount;
+        graphics.text(this.font, trimToWidth(commandsText, right - left), left, lineY, invalidCommandCount > 0 ? 0xFFFF5555 : 0xFFBBBBBB, true);
         lineY += 12;
 
-        switch (status) {
-            case RUNNING, PAUSED -> renderNextStatus(graphics, left, right, lineY);
-            case COMPLETED -> graphics.text(this.font, "Completed: " + CommandBatchRunner.completedCount() + " / " + CommandBatchRunner.totalCount() + "   Next: none", left, lineY, 0xFF55FF55, false);
-            case STOPPED -> graphics.text(this.font, "Stopped at " + CommandBatchRunner.completedCount() + " / " + CommandBatchRunner.totalCount(), left, lineY, 0xFFFFAA55, false);
-            case ERROR -> graphics.text(this.font, trimToWidth("Error: " + CommandBatchRunner.lastError(), right - left), left, lineY, 0xFFFF7777, true);
-            case IDLE -> {
-                // Nothing to show while idle - the suggestion popup (if any) renders below.
-            }
-        }
+        String completedText = "Completed: " + CommandBatchRunner.completedCount() + " / " + CommandBatchRunner.totalCount();
+        graphics.text(this.font, trimToWidth(completedText, right - left), left, lineY, 0xFFBBBBBB, true);
+        lineY += 12;
+
+        renderNextStatus(graphics, left, right, lineY);
 
         suggestionPopup.render(graphics, this.font);
     }
 
-    /** The next command that will actually be sent - not the one most recently sent - with its
-     * type/estimate/protection details folded inline (rather than one line each) - truncated as
-     * a whole if it doesn't fit. The protection/delay figures are recomputed fresh from this
-     * entry rather than read off the runner, since those track the last dispatched entry, not
-     * the upcoming one this line now describes. */
+    /** The next command that will actually be sent - not the one most recently sent - prefixed
+     * with its 1-based position among executable commands (e.g. "Next #85 / 238: ..."), which is
+     * always {@link CommandBatchRunner#nextEntryIndex()} + 1 out of
+     * {@link CommandBatchRunner#totalCount()} - never a raw editor line number, since blank/
+     * comment/invalid lines were already excluded before the batch was queued. Type/estimate/
+     * protection details are folded inline (rather than one line each), truncated as a whole if
+     * it doesn't fit. Called unconditionally for every status rather than just RUNNING/PAUSED -
+     * {@link CommandBatchRunner#nextEntry()} is already null for every other state, so
+     * "Next: none" falls out naturally without needing a switch here. */
     private void renderNextStatus(GuiGraphicsExtractor graphics, int left, int right, int lineY) {
         BatchEntry next = CommandBatchRunner.nextEntry();
         if (next == null) {
@@ -902,7 +914,13 @@ public final class BatchCommandScreen extends Screen {
             return;
         }
 
-        StringBuilder line = new StringBuilder("Next: ").append(next.command());
+        int position = CommandBatchRunner.nextEntryIndex() + 1;
+        // next.command() is always stored with its leading slash already stripped (see
+        // BatchEntry's own doc) - re-adding exactly one here is purely cosmetic, matching how the
+        // command was originally typed, and can never produce "//command" since command() itself
+        // never starts with '/'.
+        StringBuilder line = new StringBuilder("Next #").append(position).append(" / ")
+                .append(CommandBatchRunner.totalCount()).append(": /").append(next.command());
         if (next.type() != CommandType.NORMAL) {
             line.append("  [").append(next.type());
             if (next.hasEstimatedWork()) {

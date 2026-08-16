@@ -299,10 +299,12 @@ public final class CommandUtils {
     }
 
     /**
-     * Parses full batch editor text into classified entries, skipping blank/comment lines.
-     * This does real per-line work (allocation, classification) and is meant to be called at
-     * batch-start time, not on every keystroke or every tick - see {@link #countCommands} for
-     * the cheap version used for a live "Commands: N" counter.
+     * Parses full batch editor text into classified entries, skipping blank/comment lines. This
+     * does real per-line work (allocation, classification) - called at batch-start time, and
+     * also from the batch editor's live "Commands: N valid | M invalid" counter (throttled to at
+     * most once per client tick there, not once per keystroke - see BatchCommandScreen). See
+     * {@link #countCommands} for a cheaper count-only alternative where per-line classification
+     * isn't needed.
      */
     public static List<BatchEntry> parseEntries(String text) {
         List<BatchEntry> result = new ArrayList<>();
