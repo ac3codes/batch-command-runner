@@ -51,7 +51,16 @@ public final class BatchCommandRunnerClient implements ClientModInitializer {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, buildContext) ->
                 dispatcher.register(ClientCommands.literal("batch")
                         .executes(context -> {
-                            openScreen(context.getSource().getClient());
+                            // Deferred via client.execute() rather than opened inline here: this
+                            // callback runs while ChatScreen is still open and about to close
+                            // itself once command dispatch returns (its normal post-send
+                            // behavior, unconditional - it doesn't check whether some other
+                            // screen was opened in the meantime). Opening synchronously here got
+                            // immediately undone by that close, which is what made the batch UI
+                            // flash open and instantly disappear. Queuing the open for the next
+                            // drain of the client's task queue runs it after that close instead.
+                            Minecraft client = context.getSource().getClient();
+                            client.execute(() -> openScreen(client));
                             return 1;
                         })));
 

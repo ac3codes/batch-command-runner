@@ -19,7 +19,10 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.multiplayer.ClientSuggestionProvider;
+import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.Style;
+import net.minecraft.resources.Identifier;
 import org.slf4j.Logger;
 
 import java.lang.reflect.Field;
@@ -35,9 +38,36 @@ public final class BatchCommandScreen extends Screen {
     private static final String[] MINIMUM_LABELS = {"Fill:", "Clone:", "Place:", "Summon:"};
     private static final int MINIMUM_BOX_WIDTH = 34;
     private static final int MINIMUM_GROUP_GAP = 14;
-    // Matches commandBox.setLineLimit(20_000) below (5 digits covers up to 99,999) - fixed so the
-    // gutter's width never shifts as a batch grows toward that limit.
-    private static final int LINE_NUMBER_GUTTER_DIGITS = 5;
+    // Fixed (rather than grown/shrunk to the batch's actual current line count) so the gutter's
+    // width - and by extension the editor's own X position and wrap width - never shifts under
+    // the user while they're typing. 3 digits (up to 999 lines) comfortably covers realistic
+    // batches without reserving space for commandBox.setLineLimit(20_000)'s full worst case,
+    // which read as a wide, mostly-empty column for any normal-sized batch. A batch that grows
+    // past 999 lines still runs and highlights correctly - only the gutter's own number label for
+    // those rows may run out of room (see renderLineNumbers's relaxed left scissor bound, which
+    // lets an overflowing label spill left into the margin rather than getting clipped).
+    private static final int LINE_NUMBER_GUTTER_DIGITS = 3;
+    // Padding inside the line-number gutter panel, matching AbstractTextAreaWidget's own fixed
+    // 4px inner padding so the numbers sit as comfortably inside their panel as commandBox's own
+    // text does inside its border, rather than crowding either edge.
+    private static final int GUTTER_INNER_PADDING = 4;
+    // The same two sprites AbstractTextAreaWidget itself uses for a text field's own border/
+    // background (see its BACKGROUND_SPRITES) - reused by renderEditorPanel() to draw ONE such
+    // border spanning both the line-number gutter and commandBox together (which is built with
+    // showBackground(false) so it doesn't draw a second, narrower one over just its own portion),
+    // so the two read as a single editor with an internal divider rather than two boxes glued
+    // together. Focused/unfocused matches commandBox.isFocused(), same as any other text field.
+    private static final Identifier GUTTER_PANEL_SPRITE = Identifier.withDefaultNamespace("widget/text_field");
+    private static final Identifier GUTTER_PANEL_SPRITE_FOCUSED = Identifier.withDefaultNamespace("widget/text_field_highlighted");
+    // Color of the vertical divider between the line-number gutter and the editor text - visible
+    // (not just an implied edge from two abutting borders), but muted enough not to compete with
+    // the command text itself.
+    private static final int GUTTER_DIVIDER_COLOR = 0xFF5A5A5A;
+    // AbstractTextAreaWidget#totalInnerPadding() is a fixed 4px-per-side constant (not exposed
+    // publicly) that MultilineTextField wraps its text against - mirrored here so this screen's
+    // own independently-computed word-wrap (see recomputeEditorLayout) exactly matches the wrap
+    // width the editor itself actually uses.
+    private static final int EDITOR_TOTAL_INNER_PADDING = 8;
 
     private static String savedText = "";
     private static BatchSettings savedSettings = BatchConfig.load();
@@ -65,9 +95,29 @@ public final class BatchCommandScreen extends Screen {
     private Button runButton;
     private Button stopButton;
     private Button clearButton;
+    // Footer button row geometry computed once in init(), reused by updateWidgetStates() to
+    // reposition/resize runButton at runtime (see there).
+    private int footerButtonX;
+    private int footerButtonWidth;
+    private int footerButtonGap;
     // Left margin computed in init(), reused by renderLineNumbers() as the left edge of its
     // gutter column (which otherwise draws relative only to commandBox's own X position).
     private int editorMargin;
+    // Width of the line-number gutter panel, computed once in init() from LINE_NUMBER_GUTTER_DIGITS
+    // so it never has to resize as a batch grows; stored (rather than kept local to init()) since
+    // renderLineNumbers() needs it every frame to draw the gutter's own bordered panel.
+    private int lineNumberGutterWidth;
+
+    // For each raw (\n-delimited) editor line, the index of the first wrapped visual row
+    // MultiLineEditBox actually renders it on, and how many visual rows it occupies (>1 once it
+    // wraps). Recomputed once per tick from the editor's current text (see
+    // recomputeEditorLayout()) using the same word-wrap MultilineTextField itself applies
+    // internally, so every overlay this screen draws on top of the editor - highlights, line
+    // numbers, the autocomplete/ghost-hint anchor, and scroll-into-view - follows real wrapping
+    // instead of assuming one visual row per raw line, which drifted further out of alignment
+    // with the actual rendered text below every wrapped line above it.
+    private int[] rawLineFirstVisualRow = {0};
+    private int[] rawLineVisualRowCount = {1};
 
     // Count of executable lines that would actually be queued if Run were pressed right now
     // (blank/comment/empty-after-slash lines excluded, same as CommandUtils.parseEntries), split
@@ -120,9 +170,12 @@ public final class BatchCommandScreen extends Screen {
         int top = 38;
         int footerHeight = 158;
         // Reserves a gutter to the left of the editor for line numbers (see renderLineNumbers),
-        // sized for up to LINE_NUMBER_GUTTER_DIGITS digits so it never has to resize as the
-        // batch grows toward the editor's own line limit.
-        int lineNumberGutterWidth = this.font.width("0".repeat(LINE_NUMBER_GUTTER_DIGITS)) + 10;
+        // sized for up to LINE_NUMBER_GUTTER_DIGITS digits so it never has to resize as a normal
+        // batch grows (see that constant's own doc). A small fixed 2px buffer on the outer/left
+        // edge, plus GUTTER_INNER_PADDING on the seam/right side - matching the same gap
+        // renderLineNumbers leaves between the numbers and the divider - keeps the digits from
+        // crowding either edge without reserving more empty column than the digits need.
+        this.lineNumberGutterWidth = this.font.width("0".repeat(LINE_NUMBER_GUTTER_DIGITS)) + 2 + GUTTER_INNER_PADDING;
         int editorX = margin + lineNumberGutterWidth;
         int editorWidth = Math.max(220, this.width - margin * 2 - lineNumberGutterWidth);
         int editorHeight = Math.max(90, this.height - top - footerHeight);
@@ -131,7 +184,11 @@ public final class BatchCommandScreen extends Screen {
                 .setX(editorX)
                 .setY(top)
                 .setPlaceholder(Component.literal("Paste commands here — one command per line"))
-                .setShowBackground(true)
+                // False rather than true: commandBox's own border would only wrap its own
+                // portion, reading as two separate boxes touching edge-to-edge. Instead
+                // renderEditorPanel() draws one border spanning the gutter and the editor
+                // together, with just a plain divider line between the two - see its own doc.
+                .setShowBackground(false)
                 .setShowDecorations(true)
                 .build(this.font, editorWidth, editorHeight, Component.literal("Commands"));
         commandBox.setCharacterLimit(1_000_000);
@@ -153,6 +210,7 @@ public final class BatchCommandScreen extends Screen {
         // A one-time synchronous seed for the initial text, since the listener above wasn't
         // attached yet when setValue() ran a few lines up and so never fired for it.
         refreshCommandCounts(savedText);
+        recomputeEditorLayout(savedText);
         this.addRenderableWidget(commandBox);
         this.editModel = extractTextField(commandBox);
         hideSuggestions();
@@ -222,6 +280,12 @@ public final class BatchCommandScreen extends Screen {
         int gap = 6;
         int totalWidth = buttonWidth * 3 + gap * 2;
         int buttonX = (this.width - totalWidth) / 2;
+        // Stored for updateWidgetStates() to reposition/resize runButton at: it's the one button
+        // whose bounds change at runtime (see there), stretching to fill the Pause/Resume slot
+        // too whenever that button is hidden (idle - no batch to pause or resume).
+        this.footerButtonX = buttonX;
+        this.footerButtonWidth = buttonWidth;
+        this.footerButtonGap = gap;
 
         clearButton = Button.builder(Component.literal("Clear"), btn -> clearEditor())
                 .bounds(buttonX, buttonY, buttonWidth, 20)
@@ -286,6 +350,41 @@ public final class BatchCommandScreen extends Screen {
             LOGGER.error("[BatchCommandRunner] Could not access MultiLineEditBox's text field; autocomplete will be unavailable.", e);
             return null;
         }
+    }
+
+    /**
+     * Recomputes {@link #rawLineFirstVisualRow}/{@link #rawLineVisualRowCount} for the given
+     * text. Splits on the editor's own line separator first, then independently word-wraps each
+     * resulting raw line with the same {@link net.minecraft.client.StringSplitter} and wrap
+     * width {@link MultilineTextField#reflowDisplayLines} uses internally - equivalent to that
+     * method's own reflow (it treats an explicit {@code \n} as a forced break exactly like a
+     * wrapped one) without needing access to its private {@code displayLines} field. Called at
+     * most once per tick (see {@link #tick()}), same as {@link #refreshCommandCounts}, rather
+     * than once per keystroke.
+     */
+    private void recomputeEditorLayout(String text) {
+        String[] lines = text.isEmpty() ? new String[]{""} : text.split("\n", -1);
+        int wrapWidth = Math.max(1, commandBox.getWidth() - EDITOR_TOTAL_INNER_PADDING);
+        int[] firstRow = new int[lines.length];
+        int[] rowCount = new int[lines.length];
+        int visualRow = 0;
+        for (int i = 0; i < lines.length; i++) {
+            firstRow[i] = visualRow;
+            int rows = countWrappedRows(lines[i], wrapWidth);
+            rowCount[i] = rows;
+            visualRow += rows;
+        }
+        rawLineFirstVisualRow = firstRow;
+        rawLineVisualRowCount = rowCount;
+    }
+
+    /** How many visual rows a single raw line (already free of any {@code \n}) wraps onto at
+     * {@code wrapWidth} - at least 1, even for an empty line. */
+    private int countWrappedRows(String rawLine, int wrapWidth) {
+        if (rawLine.isEmpty()) {
+            return 1;
+        }
+        return Math.max(1, this.font.getSplitter().splitLines(rawLine, wrapWidth, Style.EMPTY).size());
     }
 
     /**
@@ -539,6 +638,17 @@ public final class BatchCommandScreen extends Screen {
         stopButton.visible = active;
         stopButton.active = active;
         stopButton.setMessage(Component.literal(paused ? "Resume" : "Pause"));
+
+        // Stretches runButton to fill the Pause/Resume slot too whenever that button is hidden,
+        // so idle Run Commands reads as one wide primary action instead of a single narrow
+        // button sitting off to the right with an empty gap where Pause/Resume normally is.
+        if (active) {
+            runButton.setWidth(footerButtonWidth);
+            runButton.setX(footerButtonX + (footerButtonWidth + footerButtonGap) * 2);
+        } else {
+            runButton.setWidth(footerButtonWidth * 2 + footerButtonGap);
+            runButton.setX(footerButtonX + (footerButtonWidth + footerButtonGap));
+        }
     }
 
     /** The Pause/Resume button: pauses a running batch, or resumes a paused one, without ever
@@ -567,7 +677,9 @@ public final class BatchCommandScreen extends Screen {
     public void tick() {
         super.tick();
         if (commandCountsDirty) {
-            refreshCommandCounts(commandBox.getValue());
+            String text = commandBox.getValue();
+            refreshCommandCounts(text);
+            recomputeEditorLayout(text);
             commandCountsDirty = false;
         }
         updateWidgetStates();
@@ -580,10 +692,9 @@ public final class BatchCommandScreen extends Screen {
      * editor is otherwise non-interactive during that time (locked while active; editing to
      * terminate requires stopping/resuming first), so the user has no other way to bring it back
      * on screen. Only scrolls when the line isn't already visible, so it doesn't fight a still-
-     * scrollable view once the line is already on screen. Uses the same raw-line approximation
-     * as the autocomplete popup's positioning (see {@link #suggestionAnchor}) for the same
-     * reason - MultiLineEditBox's actual word-wrapped row layout isn't accessible from outside
-     * its package.
+     * scrollable view once the line is already on screen. Spans the full range of wrapped visual
+     * rows the entry's raw line occupies (see {@link #rawLineVisualRowCount}), so a long wrapped
+     * command scrolls entirely into view rather than just its first row.
      */
     private void scrollToCurrentLineIfNeeded() {
         if (!CommandBatchRunner.isActive()) {
@@ -593,23 +704,30 @@ public final class BatchCommandScreen extends Screen {
         if (entryIndex < 0 || entryIndex >= entryLineNumbers.length) {
             return;
         }
+        int rawLine = entryLineNumbers[entryIndex];
+        if (rawLine < 0 || rawLine >= rawLineFirstVisualRow.length) {
+            return;
+        }
         int rowHeight = rowHeight();
-        int lineTop = entryLineNumbers[entryIndex] * rowHeight;
+        int lineTop = rawLineFirstVisualRow[rawLine] * rowHeight;
+        int lineBottom = lineTop + rawLineVisualRowCount[rawLine] * rowHeight;
         double scrollAmount = commandBox.scrollAmount();
         int viewportHeight = commandBox.getHeight();
         if (lineTop < scrollAmount) {
             commandBox.setScrollAmount(lineTop);
-        } else if (lineTop + rowHeight > scrollAmount + viewportHeight) {
-            commandBox.setScrollAmount(lineTop + rowHeight - viewportHeight);
+        } else if (lineBottom > scrollAmount + viewportHeight) {
+            commandBox.setScrollAmount(lineBottom - viewportHeight);
         }
     }
 
-    /** The vertical distance between successive raw text rows in commandBox, matching the pitch
-     * {@link #cursorScreenPos} already uses for the same editor - kept as one shared method so
-     * the highlight/scroll/gutter/popup positioning below can never drift out of sync with each
-     * other the way the highlight's own hardcoded row height once drifted from this. */
+    /** The vertical distance between successive visual rows in commandBox - matches
+     * MultiLineEditBox's own fixed internal row pitch (font.lineHeight, 9px for the default font)
+     * exactly, rather than padding it, so overlay math here can never drift from the real
+     * rendered rows the way an extra pixel of assumed pitch compounds into visible misalignment
+     * over many lines. Kept as one shared method so the highlight/scroll/gutter/popup positioning
+     * below can never drift out of sync with each other either. */
     private int rowHeight() {
-        return this.font.lineHeight + 1;
+        return this.font.lineHeight;
     }
 
     @Override
@@ -766,12 +884,11 @@ public final class BatchCommandScreen extends Screen {
     }
 
     /**
-     * Approximates where the cursor sits on screen so the popup can appear near it. This
-     * counts raw ({@code \n}-delimited) lines rather than the editor's internal word-wrapped
-     * display lines - MultiLineEditBox exposes no accessible way to ask "which visual row is
-     * this line on" from outside its package (that type is package-protected), so a very long
-     * single command that wraps onto multiple visual rows may anchor a little high; the popup
-     * still always ends up fully on screen either way thanks to the clamp below.
+     * Approximates where the cursor sits on screen so the popup can appear near it. The vertical
+     * row is exact (see {@link #cursorScreenPos}, backed by {@link #rawLineFirstVisualRow}); the
+     * horizontal offset still assumes the cursor's own line hasn't itself wrapped before reaching
+     * the cursor, which is a reasonable approximation for a popup anchor - the popup always ends
+     * up fully on screen either way thanks to the clamp below.
      */
     private int[] suggestionAnchor(AutocompleteUtil.LineContext context, String value) {
         int[] cursorPos = cursorScreenPos(context, value);
@@ -782,12 +899,25 @@ public final class BatchCommandScreen extends Screen {
     }
 
     /**
-     * Where the cursor currently sits on screen, in the same raw-line approximation used
-     * elsewhere in this class (see {@link #suggestionAnchor}'s own doc for why) - or {@code null}
-     * if that line isn't currently within the visible/scrolled viewport at all. Shared by the
-     * suggestion popup's anchor and the inline ghost-hint text, so the two can never drift apart.
+     * Where the cursor currently sits on screen - or {@code null} if that line isn't currently
+     * within the visible/scrolled viewport at all, or {@code context} is no longer valid against
+     * {@code value} at all (see below). Shared by the suggestion popup's anchor and the inline
+     * ghost-hint text, so the two can never drift apart. The vertical position uses
+     * {@link #rawLineFirstVisualRow} so it stays correct even when earlier lines have wrapped
+     * onto multiple visual rows; the horizontal position still assumes the current line's own
+     * wrapping (if any) hasn't yet been reached by the cursor.
+     *
+     * <p>{@code context}/{@code ghostHintText} are only refreshed once per tick (see
+     * {@link #refreshSuggestionsIfNeeded}), but this is called from every render frame in
+     * between - so a fast edit (e.g. Cmd/Ctrl+A then Backspace, clearing the whole box) can
+     * shrink {@code value} out from under an already-stale {@code context} before the next tick
+     * catches up and invalidates it. Bailing out here once {@code context} no longer fits
+     * {@code value} avoids indexing past the end of the now-shorter text.
      */
     private int[] cursorScreenPos(AutocompleteUtil.LineContext context, String value) {
+        if (context.lineStart() > value.length()) {
+            return null;
+        }
         int rawLineNumber = 0;
         for (int i = 0; i < context.lineStart(); i++) {
             if (value.charAt(i) == '\n') {
@@ -798,16 +928,17 @@ public final class BatchCommandScreen extends Screen {
         int lineHeight = rowHeight();
         int innerPad = 4;
         double scrollAmount = commandBox.scrollAmount();
-        int firstVisibleLine = (int) (scrollAmount / lineHeight);
-        int relativeLine = rawLineNumber - firstVisibleLine;
+        int visualRow = rawLineNumber < rawLineFirstVisualRow.length ? rawLineFirstVisualRow[rawLineNumber] : rawLineNumber;
+        int firstVisibleRow = (int) (scrollAmount / lineHeight);
+        int relativeRow = visualRow - firstVisibleRow;
         int approxVisibleRows = Math.max(1, commandBox.getHeight() / lineHeight);
-        if (relativeLine < 0 || relativeLine >= approxVisibleRows) {
+        if (relativeRow < 0 || relativeRow >= approxVisibleRows) {
             return null;
         }
 
         String textBeforeCursor = context.line().substring(0, Math.min(context.cursorInLine(), context.line().length()));
         int cursorX = Math.min(this.font.width(textBeforeCursor), Math.max(0, commandBox.getWidth() - innerPad * 2));
-        return new int[]{commandBox.getX() + innerPad + cursorX, commandBox.getY() + innerPad + relativeLine * lineHeight};
+        return new int[]{commandBox.getX() + innerPad + cursorX, commandBox.getY() + innerPad + relativeRow * lineHeight};
     }
 
     /**
@@ -891,6 +1022,10 @@ public final class BatchCommandScreen extends Screen {
 
     @Override
     public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+        // Must run before super's own widget rendering (which draws commandBox's text/cursor/
+        // scrollbar) - this is the shared background the editor's own content then renders on
+        // top of, not an overlay.
+        renderEditorPanel(graphics);
         super.extractRenderState(graphics, mouseX, mouseY, delta);
         renderInvalidLineHighlights(graphics);
         renderCurrentLineHighlight(graphics);
@@ -994,8 +1129,8 @@ public final class BatchCommandScreen extends Screen {
      * recently sent - on top of the editor's own already-rendered text (so it reads as a
      * highlighter mark rather than covering the text). Shown from the moment a batch starts
      * (entry #1, before anything has actually been sent) through its last wait; gone once the
-     * batch is no longer active. Uses the same raw-line approximation as
-     * {@link #scrollToCurrentLineIfNeeded}.
+     * batch is no longer active. Spans every wrapped visual row the line occupies - see
+     * {@link #fillLineHighlight}.
      */
     private void renderCurrentLineHighlight(GuiGraphicsExtractor graphics) {
         if (!CommandBatchRunner.isActive()) {
@@ -1021,29 +1156,57 @@ public final class BatchCommandScreen extends Screen {
     }
 
     /**
+     * Draws the single bordered panel commandBox and its line-number gutter share (see
+     * {@link #GUTTER_PANEL_SPRITE}), spanning from the gutter's left edge to commandBox's right
+     * edge as one continuous box - commandBox itself is built with {@code showBackground(false)}
+     * so it never draws a second, narrower border over just its own portion. Must run before
+     * {@code super.extractRenderState()} (see {@link #extractRenderState}) so it sits behind the
+     * editor's own text/cursor/scrollbar instead of covering them; the divider between the two
+     * compartments is drawn separately, on top of the already-rendered text, by
+     * {@link #renderLineNumbers}.
+     */
+    private void renderEditorPanel(GuiGraphicsExtractor graphics) {
+        Identifier sprite = commandBox.isFocused() ? GUTTER_PANEL_SPRITE_FOCUSED : GUTTER_PANEL_SPRITE;
+        int panelLeft = editorMargin;
+        int panelTop = commandBox.getY();
+        int panelRight = commandBox.getRight();
+        int panelBottom = commandBox.getBottom();
+        graphics.blitSprite(RenderPipelines.GUI_TEXTURED, sprite, panelLeft, panelTop, panelRight - panelLeft, panelBottom - panelTop);
+    }
+
+    /**
      * Draws IDE-style line numbers (1-based, one per raw {@code \n}-delimited line - blank and
-     * comment lines included, same as any code editor's gutter) in the margin reserved for them
-     * to the left of commandBox (see {@link #lineNumberGutterWidth} in init()). Scrolls in lock
-     * step with the editor since it shares the same scrollAmount and {@link #rowHeight()} the
-     * highlight/scroll logic above uses, and is scissored to its own column so a very long batch
-     * never draws numbers over the editor itself.
+     * comment lines included, same as any code editor's gutter) in the gutter compartment of the
+     * shared panel {@link #renderEditorPanel} already drew, plus the visible divider line that
+     * separates that compartment from the editor's own text - the same "line numbers on the left,
+     * a dividing line, then the code" layout a typical code editor uses, just with the divider
+     * actually drawn instead of implied by two boxes touching. A number is only drawn at its raw
+     * line's first wrapped visual row (see {@link #rawLineFirstVisualRow}) - the same convention
+     * most code editors use - so numbers stay aligned with their actual line no matter how much
+     * wrapping happens above them, instead of drifting once any line wraps. Scrolls in lock step
+     * with the editor since it shares the same scrollAmount and {@link #rowHeight()}. The right
+     * scissor bound is strict, at the divider, so a very long batch never draws numbers over the
+     * editor's own text; the left bound is left unclamped (screen edge only) so a line number
+     * that overflows the gutter's reserved digit count (see {@link #LINE_NUMBER_GUTTER_DIGITS})
+     * spills left into the margin instead of having its leading digit(s) clipped off.
      */
     private void renderLineNumbers(GuiGraphicsExtractor graphics) {
-        String value = commandBox.getValue();
         int rowHeight = rowHeight();
         int innerPad = 4;
         double scrollAmount = commandBox.scrollAmount();
         int boxTop = commandBox.getY();
         int boxBottom = commandBox.getBottom();
-        int gutterLeft = editorMargin;
-        int gutterRight = commandBox.getX() - 6;
+        int dividerX = commandBox.getX();
+        int gutterRight = dividerX - GUTTER_INNER_PADDING;
 
-        graphics.enableScissor(gutterLeft, boxTop, commandBox.getX() - 2, boxBottom);
-        int lineIndex = 0;
-        int lineStart = 0;
-        int length = value.length();
-        while (true) {
-            int lineTop = boxTop + innerPad + (int) Math.round(lineIndex * rowHeight - scrollAmount);
+        // Inset from the panel's own top/bottom edges so the divider doesn't poke past the
+        // sprite border's rounded corners.
+        graphics.fill(dividerX, boxTop + 2, dividerX + 1, boxBottom - 2, GUTTER_DIVIDER_COLOR);
+
+        graphics.enableScissor(0, boxTop, dividerX, boxBottom);
+        for (int lineIndex = 0; lineIndex < rawLineFirstVisualRow.length; lineIndex++) {
+            int visualRow = rawLineFirstVisualRow[lineIndex];
+            int lineTop = boxTop + innerPad + (int) Math.round(visualRow * rowHeight - scrollAmount);
             if (lineTop >= boxBottom) {
                 break;
             }
@@ -1051,28 +1214,24 @@ public final class BatchCommandScreen extends Screen {
                 String label = String.valueOf(lineIndex + 1);
                 graphics.text(this.font, label, gutterRight - this.font.width(label), lineTop, 0xFF888888, false);
             }
-            int newline = value.indexOf('\n', lineStart);
-            if (newline < 0) {
-                break;
-            }
-            lineStart = newline + 1;
-            lineIndex++;
-            if (lineStart > length) {
-                break;
-            }
         }
         graphics.disableScissor();
     }
 
-    /** Fills a translucent highlight rectangle over one raw editor line, scissored to the
-     * editor's own bounds so it can never bleed past it, and skipped entirely when that line
-     * isn't currently within the visible/scrolled viewport. */
+    /** Fills a translucent highlight rectangle over one raw editor line, spanning every wrapped
+     * visual row it occupies (see {@link #rawLineVisualRowCount}) as a single contiguous block,
+     * scissored to the editor's own bounds so it can never bleed past it, and skipped entirely
+     * when that line isn't currently within the visible/scrolled viewport at all. */
     private void fillLineHighlight(GuiGraphicsExtractor graphics, int rawLine, int color) {
+        if (rawLine < 0 || rawLine >= rawLineFirstVisualRow.length) {
+            return;
+        }
         int rowHeight = rowHeight();
-        int lineTop = rawLine * rowHeight;
+        int lineTop = rawLineFirstVisualRow[rawLine] * rowHeight;
+        int lineRows = rawLineVisualRowCount[rawLine];
         int innerPad = 4;
         int highlightTop = commandBox.getY() + innerPad + (int) Math.round(lineTop - commandBox.scrollAmount());
-        int highlightBottom = highlightTop + rowHeight;
+        int highlightBottom = highlightTop + lineRows * rowHeight;
 
         int boxTop = commandBox.getY();
         int boxBottom = commandBox.getBottom();
