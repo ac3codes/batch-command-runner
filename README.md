@@ -1,4 +1,4 @@
-Hello everyone! I'm Ac3. I'm writing this because I have to confess that I vibe-coded this project. I didn't know much about modding, but needed a mod that could run a large series of commands, so I vibe-coded it. I personaly didn't like that I was dependent on AI for this but I don't have enough time to pick up java, so I apologize for that. All the designs and ui decisions are made by me. Anyway, thanks for using my mod.
+Hello everyone! I'm Ac3. I'm writing this because I have to confess that I vibe-coded this project. I didn't know much about modding, but needed a mod that could run a large series of commands, so I vibe-coded it. I personally didn't like that I was dependent on AI for this but I don't have enough time to pick up java, so I apologize for that. All the designs and ui decisions are made by me. Anyway, thanks for using my mod.
 
 # Batch Command Runner (Fabric 26.2)
 
