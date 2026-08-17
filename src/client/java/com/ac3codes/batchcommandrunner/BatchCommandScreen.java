@@ -16,6 +16,7 @@ import net.minecraft.client.gui.components.MultiLineEditBox;
 import net.minecraft.client.gui.components.MultilineTextField;
 import net.minecraft.client.gui.components.Whence;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.CharacterEvent;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.multiplayer.ClientSuggestionProvider;
@@ -145,6 +146,10 @@ public final class BatchCommandScreen extends Screen {
     // extractTextField() for why this is still the least fragile option available.
     private MultilineTextField editModel;
 
+    // Compact modal tutorial overlay - see its own doc for why this is a plain field rendered/
+    // routed to manually by this screen rather than a separate Screen pushed on top of this one.
+    private final TutorialPopup tutorialPopup = new TutorialPopup(TutorialPages.ALL);
+
     private final SuggestionPopup suggestionPopup = new SuggestionPopup();
     private AutocompleteUtil.LineContext currentLineContext;
     private String lastSuggestionValue;
@@ -168,7 +173,11 @@ public final class BatchCommandScreen extends Screen {
         int margin = Math.max(16, this.width / 16);
         this.editorMargin = margin;
         int top = 38;
-        int footerHeight = 158;
+        // 12px shorter than the space a 4-row status block (Status/Commands/Completed/Next) used
+        // to need - the status block below the editor is now only 3 rows (Status/Commands/Current
+        // line), and this stays in step so that saved row goes to the editor instead of sitting as
+        // unused whitespace above the footer buttons.
+        int footerHeight = 146;
         // Reserves a gutter to the left of the editor for line numbers (see renderLineNumbers),
         // sized for up to LINE_NUMBER_GUTTER_DIGITS digits so it never has to resize as a normal
         // batch grows (see that constant's own doc). A small fixed 2px buffer on the outer/left
@@ -306,6 +315,21 @@ public final class BatchCommandScreen extends Screen {
         this.addRenderableWidget(clearButton);
         this.addRenderableWidget(stopButton);
         this.addRenderableWidget(runButton);
+
+        // Small utility buttons in the upper-right corner: "?" opens the tutorial popup over
+        // this same screen (see TutorialPopup), "X" closes Batch Command Runner exactly like
+        // Escape/vanilla back-navigation would (onClose()) - it never touches the batch itself,
+        // so a running or paused batch keeps going/stays paused after this screen closes.
+        int utilButtonSize = 16;
+        int utilGap = 4;
+        Button closeScreenButton = Button.builder(Component.literal("X"), btn -> this.onClose())
+                .bounds(this.width - 6 - utilButtonSize, 6, utilButtonSize, utilButtonSize)
+                .build();
+        Button helpButton = Button.builder(Component.literal("?"), btn -> tutorialPopup.open())
+                .bounds(closeScreenButton.getX() - utilGap - utilButtonSize, 6, utilButtonSize, utilButtonSize)
+                .build();
+        this.addRenderableWidget(helpButton);
+        this.addRenderableWidget(closeScreenButton);
 
         updateWidgetStates();
         this.setInitialFocus(commandBox);
@@ -683,7 +707,13 @@ public final class BatchCommandScreen extends Screen {
             commandCountsDirty = false;
         }
         updateWidgetStates();
-        refreshSuggestionsIfNeeded();
+        // Skipped while the tutorial is open: input is already fully blocked from reaching the
+        // editor at that point (see mouseClicked/keyPressed/charTyped), so there's nothing for a
+        // freshly (re)computed suggestion popup to do but sit there wastefully recomputed every
+        // tick behind the dimmed overlay.
+        if (!tutorialPopup.isOpen()) {
+            refreshSuggestionsIfNeeded();
+        }
         scrollToCurrentLineIfNeeded();
     }
 
@@ -732,6 +762,15 @@ public final class BatchCommandScreen extends Screen {
 
     @Override
     public boolean keyPressed(KeyEvent event) {
+        // Modal: while the tutorial is open, it alone decides what a keypress does (Escape
+        // closes just the tutorial, not this whole screen - see its own doc) and every key is
+        // consumed here rather than falling through, so nothing below (autocomplete navigation,
+        // the Ctrl+Enter run shortcut, or Screen's own Escape-closes-screen handling) can ever
+        // see it.
+        if (tutorialPopup.isOpen()) {
+            return tutorialPopup.keyPressed(event);
+        }
+
         if (suggestionPopup.isVisible() && commandBox.isFocused() && !CommandBatchRunner.isActive()) {
             if (event.isUp()) {
                 suggestionPopup.moveSelection(-1);
@@ -768,6 +807,13 @@ public final class BatchCommandScreen extends Screen {
 
     @Override
     public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        // Modal: routes every click to the tutorial's own widgets while it's open, so a click
+        // can never reach the editor, autocomplete popup, or any of Batch Commander's own
+        // buttons underneath - see TutorialPopup's own doc.
+        if (tutorialPopup.isOpen()) {
+            return tutorialPopup.mouseClicked(event, doubleClick);
+        }
+
         if (suggestionPopup.isVisible()) {
             if (suggestionPopup.isMouseOver(event.x(), event.y())) {
                 Suggestion clicked = suggestionPopup.rowAt(event.x(), event.y());
@@ -783,11 +829,26 @@ public final class BatchCommandScreen extends Screen {
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        // Consumed here rather than falling through - otherwise a wheel scroll anywhere over the
+        // (still-rendered-but-dimmed) background would reach and scroll commandBox underneath.
+        if (tutorialPopup.isOpen()) {
+            return tutorialPopup.mouseScrolled();
+        }
         if (suggestionPopup.isVisible() && suggestionPopup.isMouseOver(mouseX, mouseY)) {
             suggestionPopup.scroll(scrollY);
             return true;
         }
         return super.mouseScrolled(mouseX, mouseY, scrollX, scrollY);
+    }
+
+    @Override
+    public boolean charTyped(CharacterEvent event) {
+        // commandBox may still be focused from before the tutorial opened - without this, typed
+        // characters would keep reaching (and silently editing) it underneath the dimmed overlay.
+        if (tutorialPopup.isOpen()) {
+            return true;
+        }
+        return super.charTyped(event);
     }
 
     /**
@@ -1055,20 +1116,15 @@ public final class BatchCommandScreen extends Screen {
         int right = commandBox.getRight();
 
         BatchRunnerState.Status status = CommandBatchRunner.status();
-        boolean active = status == BatchRunnerState.Status.RUNNING || status == BatchRunnerState.Status.PAUSED;
 
-        // Status / Commands / Completed / Next are one visually grouped block, always rendered
-        // as the same four rows in the same order regardless of state - only the text and color
-        // of each row changes - so the layout never jumps as the batch moves between states.
+        // Status / Commands / Current line are one visually grouped block, always rendered as the
+        // same three rows in the same order regardless of state - only the text and color of each
+        // row changes - so the layout never jumps as the batch moves between states.
         String statusText = "Status: " + status.label();
         if (status == BatchRunnerState.Status.ERROR && !CommandBatchRunner.lastError().isEmpty()) {
             statusText += " - " + CommandBatchRunner.lastError();
         }
         graphics.text(this.font, trimToWidth(statusText, right - left), left, lineY, statusColor(), true);
-        if (active) {
-            String nextIn = "Next command in: " + CommandBatchRunner.ticksUntilNext() + " ticks";
-            graphics.text(this.font, nextIn, right - this.font.width(nextIn), lineY, 0xFFBBBBBB, false);
-        }
         lineY += 12;
 
         String commandsText = invalidCommandCount > 0
@@ -1077,51 +1133,26 @@ public final class BatchCommandScreen extends Screen {
         graphics.text(this.font, trimToWidth(commandsText, right - left), left, lineY, invalidCommandCount > 0 ? 0xFFFF5555 : 0xFFBBBBBB, true);
         lineY += 12;
 
-        String completedText = "Completed: " + CommandBatchRunner.completedCount() + " / " + CommandBatchRunner.totalCount();
-        graphics.text(this.font, trimToWidth(completedText, right - left), left, lineY, 0xFFBBBBBB, true);
-        lineY += 12;
-
-        renderNextStatus(graphics, left, right, lineY);
+        renderCurrentLineStatus(graphics, left, lineY);
 
         suggestionPopup.render(graphics, this.font);
+
+        // Rendered last so it draws on top of everything above (including the dimmed-but-still-
+        // visible Batch Commander UI) - a no-op when the tutorial isn't open.
+        tutorialPopup.render(graphics, this.font, this.width, this.height, mouseX, mouseY, delta);
     }
 
-    /** The next command that will actually be sent - not the one most recently sent - prefixed
-     * with its 1-based position among executable commands (e.g. "Next #85 / 238: ..."), which is
-     * always {@link CommandBatchRunner#nextEntryIndex()} + 1 out of
-     * {@link CommandBatchRunner#totalCount()} - never a raw editor line number, since blank/
-     * comment/invalid lines were already excluded before the batch was queued. Type/estimate/
-     * protection details are folded inline (rather than one line each), truncated as a whole if
-     * it doesn't fit. Called unconditionally for every status rather than just RUNNING/PAUSED -
-     * {@link CommandBatchRunner#nextEntry()} is already null for every other state, so
-     * "Next: none" falls out naturally without needing a switch here. */
-    private void renderNextStatus(GuiGraphicsExtractor graphics, int left, int right, int lineY) {
-        BatchEntry next = CommandBatchRunner.nextEntry();
-        if (next == null) {
-            graphics.text(this.font, "Next: none", left, lineY, 0xFFEEEEEE, false);
-            return;
-        }
-
-        int position = CommandBatchRunner.nextEntryIndex() + 1;
-        // next.command() is always stored with its leading slash already stripped (see
-        // BatchEntry's own doc) - re-adding exactly one here is purely cosmetic, matching how the
-        // command was originally typed, and can never produce "//command" since command() itself
-        // never starts with '/'.
-        StringBuilder line = new StringBuilder("Next #").append(position).append(" / ")
-                .append(CommandBatchRunner.totalCount()).append(": /").append(next.command());
-        if (next.type() != CommandType.NORMAL) {
-            line.append("  [").append(next.type());
-            if (next.hasEstimatedWork()) {
-                line.append(", ").append(String.format("%,d", next.estimatedWork())).append(" blocks");
-            }
-            BatchSettings settings = CommandBatchRunner.settings();
-            int effectiveDelay = CommandUtils.calculateEffectiveDelay(next, settings);
-            if (settings.heavyCommandProtection() && effectiveDelay > settings.normalDelay()) {
-                line.append(", +").append(effectiveDelay).append(" ticks");
-            }
-            line.append(']');
-        }
-        graphics.text(this.font, trimToWidth(line.toString(), right - left), left, lineY, 0xFFEEEEEE, false);
+    /** The raw (1-based) editor line number of the command currently highlighted in commandBox -
+     * the same line {@link #renderCurrentLineHighlight} marks, and the same numbering
+     * {@link #renderLineNumbers}'s gutter itself uses - so this row and the highlight it
+     * describes can never drift out of sync. "none" whenever there's no active batch to highlight
+     * a line for. */
+    private void renderCurrentLineStatus(GuiGraphicsExtractor graphics, int left, int lineY) {
+        int entryIndex = CommandBatchRunner.nextEntryIndex();
+        String text = CommandBatchRunner.isActive() && entryIndex >= 0 && entryIndex < entryLineNumbers.length
+                ? "Current line: " + (entryLineNumbers[entryIndex] + 1)
+                : "Current line: none";
+        graphics.text(this.font, text, left, lineY, 0xFFEEEEEE, false);
     }
 
     /**

@@ -8,6 +8,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
 public final class BatchCommandRunnerClient implements ClientModInitializer {
@@ -31,6 +32,13 @@ public final class BatchCommandRunnerClient implements ClientModInitializer {
             return false;
         }
         return openKey.same(Minecraft.getInstance().options.keyCommand);
+    }
+
+    /** The currently configured display name for the batch UI's own open keybind (e.g. "/" or
+     * whatever the user has rebound it to) - used by the tutorial's "Open It Anytime" page so it
+     * never shows a hard-coded key that could drift from what's actually bound. */
+    public static Component getOpenKeyDisplay() {
+        return openKey.getTranslatedKeyMessage();
     }
 
     @Override
