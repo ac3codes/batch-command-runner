@@ -133,8 +133,14 @@ public final class BatchCommandScreen extends Screen {
     // Maps a started batch's entry index to the raw (\n-delimited) line number it came from in
     // the editor text, since blank/comment lines are skipped when building entries and so don't
     // line up 1:1 with them. Computed once when Run is pressed; used to highlight/scroll to the
-    // line currently executing.
-    private int[] entryLineNumbers = new int[0];
+    // line currently executing. Static (like savedText/savedSettings) so it survives the screen
+    // being closed and reopened while the batch keeps running in the background - otherwise a
+    // fresh BatchCommandScreen instance would reset this to empty and lose the highlight, the
+    // "Current line" readout, and auto-scroll-into-view until the batch finished. Safe to leave
+    // stale once a batch stops: every reader below is gated on CommandBatchRunner.isActive(), and
+    // any edit to the text while active immediately hard-stops the batch (see commandBox's value
+    // listener), so this mapping can never drift out of sync with savedText while it's in use.
+    private static int[] entryLineNumbers = new int[0];
     // Raw line numbers whose command isn't something that could actually run - only recomputed
     // on an Enter press or a Run press (never live while typing), and cleared immediately on any
     // edit; used both to highlight them red in the editor and to skip them when Run is pressed
