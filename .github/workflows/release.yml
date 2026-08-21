@@ -23,12 +23,6 @@ jobs:
       - name: Build
         run: ./gradlew build -Dorg.gradle.java.home="$JAVA_HOME"
 
-      - name: Publish to Modrinth
-        if: ${{ vars.MODRINTH_ID != '' }}
-        env:
-          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
-        run: ./gradlew modrinth -Dorg.gradle.java.home="$JAVA_HOME" -Pmodrinth_id="${{ vars.MODRINTH_ID }}"
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
